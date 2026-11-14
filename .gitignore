@@ -1,0 +1,75 @@
+﻿# ── Rust build output ─────────────────────────────────────────────────────────
+/target
+*.pdb
+*.rs.bk
+*.old.exe
+
+# Binaries and libraries (the FFmpeg runtime shipped with the Windows build is kept)
+*.exe
+*.dll
+!avcodec-61.dll
+!avutil-59.dll
+!swresample-5.dll
+!swscale-8.dll
+!w32-pthreads.dll
+!zlib.dll
+
+# ── kiyora local data (sessions, caches, settings) ─────────────────────────
+.kiyora_*
+.kiyora_*/**
+.tui_status.txt
+
+# ── Logs, measurements and media dumps from local runs ───────────────────────
+*.log
+*.csv
+*.txt
+*.wav
+*.bin
+*.yuv
+*.h264
+*.dmp
+*.core
+build_*.txt
+# License texts (bundled fonts, vendored crates) must stay in the repository.
+!assets/**/*.txt
+!vendor/**/LICENSES/*.txt
+
+# Scratch files and one-off test scripts at the repository root
+scratch/
+scratch_*
+/test_*.py
+__pycache__/
+*.pyc
+
+# ── Backups and editor temporaries ───────────────────────────────────────────
+backup_*
+*.bak
+*.old
+*.orig
+*.tmp
+*.temp
+*.swp
+*~
+
+# ── Archives and release packaging ───────────────────────────────────────────
+*.tar.gz
+*.tar
+*.zip
+*.patch
+*.diff
+*.bundle
+release-pkg/
+
+# ── IDE and OS files ─────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Secrets ──────────────────────────────────────────────────────────────────
+*.pem
+*.key
+*.env
+*.env.*
+*.bat

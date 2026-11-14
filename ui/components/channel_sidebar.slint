@@ -1,0 +1,640 @@
+import { VerticalBox, HorizontalBox, ScrollView } from "std-widgets.slint";
+import { AppTheme , TypeScale } from "../theme.slint";
+import { IconButton } from "icon_button.slint";
+
+export struct ChannelItem {
+    id: string,
+    name: string,
+    is_voice: bool,
+    voice_count: int,
+    is_voice_member: bool,
+    parent_channel_id: string,
+    avatar_text: string,
+    avatar_url: string,
+    avatar_slot: int,
+    is_category: bool,
+    has_parent: bool,
+    is_collapsed: bool,
+    has_separator: bool,
+    unread_count: int,  // Badge de mensagens não lidas (0 = sem badge)
+    // Leading emoji of the name, drawn as a colour image; `label` is the rest of the name.
+    emoji_id: string,
+    emoji_slot: int,    // index into `emoji_pool`
+    label: string,
+}
+
+
+export component ChannelSidebar inherits Rectangle {
+    in property <string> active_guild_name;
+    in property <string> tr_server_channels;
+    in property <[ChannelItem]> channels;
+    // Shared thumbnail pool: a row shows pool[slot] only while pool_urls[slot]
+    // still equals its own avatar_url, so a recycled slot never shows a wrong face.
+    in property <[image]> avatar_pool;
+    in property <[image]> emoji_pool;
+    in property <[string]> avatar_pool_urls;
+    in-out property <string> active_channel_id;
+    in property <bool> is_in_voice;
+    in property <bool> is_voice_connecting;
+    in property <bool> is_muted;
+    in property <bool> is_deafened;
+    in property <string> tr_voice_connecting;
+    in property <string> tr_voice_connected;
+    in property <string> current_voice_channel;
+    in property <string> tr_leave;
+    in property <string> user_tag;
+    in property <string> user_display_name;
+    in property <string> user_handle;
+    in property <string> user_avatar_initials;
+    in property <bool> user_avatar_has_image;
+    in property <image> user_avatar_img;
+    callback select_channel(string);
+    callback toggle_category(string);
+    callback leave_voice();
+    callback toggle_user_menu();
+    callback toggle_mute();
+    callback toggle_deafen();
+    callback open_settings();
+    callback reorder_channel(int, int);
+    pure callback channel_drop_row(int, length) -> int;
+    in-out property <int> dragging_channel_idx: -1;
+    in-out property <int> drop_target_channel_idx: -1;
+
+    // Dragged by the handle on the right edge; saved when the drag ends.
+    in-out property <length> sidebar_width: 230px;
+    callback sidebar_width_committed(length);
+
+    width: sidebar_width;
+    background: AppTheme.surface-sidebar;
+    border-top-left-radius: 8px;
+    clip: true;
+
+    VerticalBox {
+        padding: 8px;
+        spacing: 6px;
+
+        HorizontalLayout {
+            padding-left: 4px;
+            padding-right: 4px;
+            padding-top: 2px;
+            padding-bottom: 2px;
+
+            Text {
+                text: root.active_guild_name != "" ? root.active_guild_name : root.tr_server_channels;
+                color: AppTheme.text-strong;
+                font-size: TypeScale.title;
+                font-weight: 700;
+                overflow: elide;
+                vertical-alignment: center;
+            }
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+
+            ScrollView {
+                width: 100%;
+                height: 100%;
+                viewport-width: self.visible-width;
+                VerticalLayout {
+                    padding: 0px;
+                    spacing: 4px;
+                    alignment: start;
+
+                    for channel[idx] in root.channels: VerticalLayout {
+                        spacing: 0px;
+
+                        // Drop indicator line above channel
+                        if root.drop_target_channel_idx == idx && root.dragging_channel_idx >= 0 && root.dragging_channel_idx != idx && !channel.is_category: Rectangle {
+                            height: 2px;
+                            width: 100%;
+                            background: #5865F2;
+                            border-radius: 1px;
+                        }
+
+                        Rectangle {
+                            height: channel.is_category ? (channel.has_separator ? 36px : 26px) : (channel.is_voice_member ? 26px : 34px);
+                            background: channel.is_category
+                                ? transparent
+                                : (channel.id == root.active_channel_id
+                                    ? AppTheme.interactive-selected
+                                    : (touch_area.has_hover ? AppTheme.interactive-hover : transparent));
+                            border-radius: 4px;
+                            opacity: (root.dragging_channel_idx == idx) ? 0.4 : 1.0;
+                            animate background, opacity { duration: 120ms; }
+
+                        // Category rendering
+                        if channel.is_category : VerticalLayout {
+                            padding-top: channel.has_separator ? 6px : 0px;
+                            padding-bottom: 2px;
+                            spacing: 6px;
+                            alignment: center;
+
+                            // Sleek rounded separator only from the 2nd category onwards
+                            if channel.has_separator : HorizontalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: root.sidebar_width - 60px;
+                                    height: 2px;
+                                    border-radius: 1px;
+                                    background: AppTheme.separator;
+                                }
+                            }
+
+                            HorizontalLayout {
+                                padding-left: 4px;
+                                padding-right: 8px;
+                                spacing: 6px;
+
+                                VerticalLayout {
+                                    alignment: center;
+                                    width: 14px;
+                                    Image {
+                                        source: channel.is_collapsed ? @image-url("../../assets/chevron-right.svg") : @image-url("../../assets/chevron-down.svg");
+                                        width: 11px;
+                                        height: 11px;
+                                        colorize: touch_area.has_hover ? AppTheme.text-strong : AppTheme.text-muted;
+                                        image-fit: contain;
+                                        animate colorize { duration: 120ms; }
+                                    }
+                                }
+
+                                if channel.emoji_id != "": VerticalLayout {
+                                    alignment: center;
+                                    Image {
+                                        source: root.emoji_pool[channel.emoji_slot];
+                                        width: 14px;
+                                        height: 14px;
+                                        image-fit: contain;
+                                    }
+                                }
+                                Text {
+                                    text: channel.emoji_id != "" ? channel.label : channel.name;
+                                    color: touch_area.has_hover ? AppTheme.text-strong : AppTheme.text-muted;
+                                    font-size: TypeScale.caption;
+                                    font-weight: 800;
+                                    horizontal-alignment: left;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                    overflow: elide;
+                                    animate color { duration: 120ms; }
+                                }
+                            }
+                        }
+
+                        // Channel rendering (Text and Voice)
+                        if !channel.is_category && !channel.is_voice_member : HorizontalLayout {
+                            padding-left: channel.has_parent ? 18px : 8px;
+                            padding-right: 8px;
+                            spacing: 6px;
+
+                            // Voice channel icon: speaker
+                            if channel.is_voice : VerticalLayout {
+                                alignment: center;
+                                width: 14px;
+                                Image {
+                                    source: @image-url("../../assets/speaker.svg");
+                                    width: 14px;
+                                    height: 14px;
+                                    colorize: (channel.id == root.active_channel_id) ? AppTheme.accent-soft : AppTheme.accent;
+                                    image-fit: contain;
+                                }
+                            }
+
+                            // Text channel icon: avatar initials (if DM) or '#' (if server channel)
+                            if !channel.is_voice : VerticalLayout {
+                                alignment: center;
+                                width: channel.avatar_text != "" ? 22px : 14px;
+                                if channel.avatar_text != "" : Rectangle {
+                                    width: 20px;
+                                    height: 20px;
+                                    border-radius: 10px;
+                                    background: (channel.id == root.active_channel_id) ? AppTheme.accent : AppTheme.interactive-selected;
+                                    clip: true;
+                                    Text {
+                                        text: channel.avatar_text;
+                                        color: (channel.id == root.active_channel_id) ? AppTheme.text-on-accent : AppTheme.text-strong;
+                                        font-size: TypeScale.micro;
+                                        font-weight: 700;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    if channel.avatar_url != "" && root.avatar_pool_urls[channel.avatar_slot] == channel.avatar_url: Image {
+                                        source: root.avatar_pool[channel.avatar_slot];
+                                        width: 100%;
+                                        height: 100%;
+                                        image-fit: cover;
+                                    }
+                                }
+                                if channel.avatar_text == "" : Text {
+                                    text: "#";
+                                    color: touch_area.has_hover ? AppTheme.text-strong : (channel.id == root.active_channel_id ? AppTheme.accent-soft : AppTheme.text-subtle);
+                                    font-size: TypeScale.title;
+                                    font-weight: 700;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    animate color { duration: 120ms; }
+                                }
+                            }
+
+                            // Channel Name (leading emoji as a colour image)
+                            if channel.emoji_id != "": VerticalLayout {
+                                alignment: center;
+                                Image {
+                                    source: root.emoji_pool[channel.emoji_slot];
+                                    width: 16px;
+                                    height: 16px;
+                                    image-fit: contain;
+                                }
+                            }
+                            Text {
+                                text: channel.emoji_id != "" ? channel.label : channel.name;
+                                color: touch_area.has_hover ? AppTheme.text-strong : (channel.id == root.active_channel_id ? AppTheme.text-strong : (channel.unread_count > 0 ? AppTheme.text-strong : AppTheme.text-primary));
+                                font-size: TypeScale.body;
+                                font-weight: channel.unread_count > 0 ? 700 : 600;
+                                horizontal-alignment: left;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                                animate color { duration: 120ms; }
+                            }
+
+                            // Unread message count badge (red pill for DMs)
+                            if channel.unread_count > 0 && channel.id != root.active_channel_id : VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: channel.unread_count > 99 ? 28px : (channel.unread_count > 9 ? 24px : 20px);
+                                    height: 20px;
+                                    border-radius: 10px;
+                                    background: #ed4245;
+
+                                    Text {
+                                        x: -1px;
+                                        width: parent.width;
+                                        height: parent.height;
+                                        text: channel.unread_count > 99 ? "99+" : "\{channel.unread_count}";
+                                        color: #ffffff;
+                                        font-size: TypeScale.caption;
+                                        font-weight: 700;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+
+                            // Voice user count badge (Perfect round circle in blue)
+                            if channel.is_voice && channel.voice_count > 0 : VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 20px;
+                                    height: 20px;
+                                    border-radius: 10px;
+                                    background: AppTheme.accent-bright;
+
+                                    Text {
+                                        text: "\{channel.voice_count}";
+                                        color: AppTheme.text-on-accent;
+                                        font-size: TypeScale.caption;
+                                        font-weight: 700;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Participants remain separate rows under their voice channel.
+                        if channel.is_voice_member : HorizontalLayout {
+                            padding-left: channel.has_parent ? 38px : 28px;
+                            padding-right: 8px;
+                            spacing: 8px;
+
+                            VerticalLayout {
+                                alignment: center;
+                                width: 18px;
+                                Rectangle {
+                                    width: 18px;
+                                    height: 18px;
+                                    border-radius: 9px;
+                                    background: AppTheme.interactive-selected;
+                                    clip: true;
+                                    Text {
+                                        text: channel.avatar_text;
+                                        color: AppTheme.text-primary;
+                                        font-size: TypeScale.micro;
+                                        font-weight: 700;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    if channel.avatar_url != "" && root.avatar_pool_urls[channel.avatar_slot] == channel.avatar_url: Image {
+                                        source: root.avatar_pool[channel.avatar_slot];
+                                        width: 100%;
+                                        height: 100%;
+                                        image-fit: cover;
+                                    }
+                                }
+                            }
+                            Text {
+                                text: channel.name;
+                                color: touch_area.has-hover ? AppTheme.text-strong : AppTheme.text-muted;
+                                font-size: TypeScale.small;
+                                font-weight: 500;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                                animate color { duration: 120ms; }
+                            }
+                        }
+
+                        touch_area := TouchArea {
+                            mouse-cursor: pointer;
+                            pointer-event(event) => {
+                                if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
+                                    if (root.dragging_channel_idx >= 0 && root.drop_target_channel_idx >= 0 && root.dragging_channel_idx != root.drop_target_channel_idx) {
+                                        root.reorder_channel(root.dragging_channel_idx, root.drop_target_channel_idx);
+                                    }
+                                    root.dragging_channel_idx = -1;
+                                    root.drop_target_channel_idx = -1;
+                                }
+                            }
+                            moved => {
+                                if (!channel.is_category && !channel.is_voice_member) {
+                                    // The pressed row keeps the pointer while dragged: the target
+                                    // comes from how far it moved (computed where row heights are known).
+                                    if (self.pressed) {
+                                        let diff_y = self.mouse-y - self.pressed-y;
+                                        if (root.dragging_channel_idx < 0 && (diff_y > 8px || diff_y < -8px)) {
+                                            root.dragging_channel_idx = idx;
+                                        }
+                                        if (root.dragging_channel_idx == idx) {
+                                            root.drop_target_channel_idx = root.channel_drop_row(idx, diff_y);
+                                        }
+                                    }
+                                }
+                            }
+                            clicked => {
+                                if (root.dragging_channel_idx < 0) {
+                                    if channel.is_category {
+                                        root.toggle_category(channel.id);
+                                    } else {
+                                        root.active_channel_id = channel.is_voice_member ? channel.parent_channel_id : channel.id;
+                                        root.select_channel(channel.is_voice_member ? channel.parent_channel_id : channel.id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+        // Active Voice Channel Banner
+        if root.is_in_voice: Rectangle {
+            height: 44px;
+            background: root.is_voice_connecting ? AppTheme.warning-strong : AppTheme.accent;
+            border-radius: 6px;
+
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                spacing: 8px;
+
+                VerticalLayout {
+                    alignment: center;
+                    Image {
+                        source: @image-url("../../assets/speaker.svg");
+                        width: 14px;
+                        height: 14px;
+                        colorize: AppTheme.text-on-accent;
+                        image-fit: contain;
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 1px;
+                    Text {
+                        text: root.is_voice_connecting ? root.tr_voice_connecting : root.tr_voice_connected;
+                        color: AppTheme.text-on-accent;
+                        font-size: TypeScale.caption;
+                        font-weight: 800;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: root.current_voice_channel;
+                        color: AppTheme.text-on-status;
+                        font-size: TypeScale.micro;
+                        font-weight: 500;
+                        overflow: elide;
+                    }
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        height: 28px;
+                        border-radius: 4px;
+                        border-width: 1px;
+                        border-color: btn_leave_sidebar_ta.has-hover ? AppTheme.text-on-accent : AppTheme.border-on-accent-muted;
+                        background: btn_leave_sidebar_ta.pressed ? AppTheme.danger-pressed : (btn_leave_sidebar_ta.has-hover ? AppTheme.danger-bright : AppTheme.surface-translucent);
+                        animate background { duration: 120ms; }
+                        animate border-color { duration: 120ms; }
+
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 6px;
+                            alignment: center;
+
+                            VerticalLayout {
+                                alignment: center;
+                                Image {
+                                    source: @image-url("../../assets/log-out.svg");
+                                    width: 13px;
+                                    height: 13px;
+                                    colorize: AppTheme.text-on-accent;
+                                    image-fit: contain;
+                                }
+                            }
+
+                            Text {
+                                text: root.tr_leave;
+                                color: AppTheme.text-on-accent;
+                                font-size: TypeScale.caption;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        btn_leave_sidebar_ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.leave_voice(); }
+                        }
+                    }
+                }
+            }
+        }
+
+        // User Footer in Channels bar
+        Rectangle {
+            height: 52px;
+            background: AppTheme.surface-elevated;
+            border-radius: 6px;
+
+            HorizontalLayout {
+                padding-left: 6px;
+                padding-right: 6px;
+                padding-top: 4px;
+                padding-bottom: 4px;
+                spacing: 2px;
+                alignment: space-between;
+
+                // Left: User Profile Box (Avatar + 2-line name)
+                Rectangle {
+                    background: user_profile_touch.has-hover ? AppTheme.interactive-hover : transparent;
+                    border-radius: 4px;
+                    horizontal-stretch: 1;
+
+                    HorizontalLayout {
+                        padding-left: 4px;
+                        padding-right: 4px;
+                        spacing: 8px;
+                        alignment: start;
+
+                        // 32x32 Avatar with status dot, centred in the card
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 32px;
+                                height: 32px;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Rectangle {
+                                        width: 32px;
+                                        height: 32px;
+                                        border-radius: 16px;
+                                        clip: true;
+                                        background: AppTheme.accent;
+
+                                        if root.user_avatar_has_image: Image {
+                                            source: root.user_avatar_img;
+                                            width: 32px;
+                                            height: 32px;
+                                            image-fit: cover;
+                                        }
+
+                                        if !root.user_avatar_has_image: Text {
+                                            text: root.user_avatar_initials != "" ? root.user_avatar_initials : "U";
+                                            color: AppTheme.text-on-accent;
+                                            font-size: TypeScale.body;
+                                            font-weight: 700;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+
+                                // Status Dot (Online: #23A55A)
+                                Rectangle {
+                                    x: 22px;
+                                    y: 22px;
+                                    width: 10px;
+                                    height: 10px;
+                                    border-radius: 5px;
+                                    background: #23A55A;
+                                    border-width: 2px;
+                                    border-color: AppTheme.surface-elevated;
+                                }
+                            }
+                        }
+
+                        // 2-line column: Display Name & @username
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 1px;
+                            horizontal-stretch: 1;
+
+                            Text {
+                                text: root.user_display_name != "" ? root.user_display_name : root.user_tag;
+                                color: AppTheme.text-strong;
+                                font-size: TypeScale.small;
+                                font-weight: 700;
+                                overflow: elide;
+                                vertical-alignment: center;
+                            }
+
+                            Text {
+                                text: root.user_handle != "" ? root.user_handle : "Online";
+                                color: AppTheme.text-muted;
+                                font-size: TypeScale.micro;
+                                font-weight: 500;
+                                overflow: elide;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+
+                    user_profile_touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.toggle_user_menu();
+                        }
+                    }
+                }
+
+                // Right: Controls, centred in the card
+                VerticalLayout {
+                    alignment: center;
+                    HorizontalLayout {
+                        spacing: 2px;
+                        alignment: center;
+
+                        IconButton {
+                            icon: root.is_muted ? @image-url("../../assets/microphone-mute.svg") : @image-url("../../assets/microphone.svg");
+                            icon-color: root.is_muted ? AppTheme.danger : AppTheme.text-primary;
+                            clicked => { root.toggle_mute(); }
+                        }
+
+                        IconButton {
+                            icon: root.is_deafened ? @image-url("../../assets/headphones-mute.svg") : @image-url("../../assets/headphones.svg");
+                            icon-color: root.is_deafened ? AppTheme.danger : AppTheme.text-primary;
+                            clicked => { root.toggle_deafen(); }
+                        }
+
+                        IconButton {
+                            icon: @image-url("../../assets/settings.svg");
+                            clicked => { root.open_settings(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Resize handle: drag the right edge to widen or narrow the channel list.
+    resize_handle := TouchArea {
+        x: parent.width - 6px;
+        width: 6px;
+        height: parent.height;
+        mouse-cursor: ew-resize;
+        moved => {
+            if (self.pressed) {
+                root.sidebar_width = clamp(root.sidebar_width + (self.mouse-x - self.pressed-x), 180px, 420px);
+            }
+        }
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.up) {
+                root.sidebar_width_committed(root.sidebar_width);
+            }
+        }
+    }
+    if resize_handle.has-hover || resize_handle.pressed: Rectangle {
+        x: parent.width - 2px;
+        width: 2px;
+        height: parent.height;
+        background: AppTheme.accent;
+    }
+}

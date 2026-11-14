@@ -1,0 +1,2661 @@
+﻿#![allow(dead_code)]
+
+use std::collections::HashMap;
+
+/// Peers whose frames were dropped because the decode queue was full. The decoder skips
+/// their following frames (they reference the dropped one and would come out corrupted)
+/// and asks that peer for a keyframe.
+static DECODE_RESYNC: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+/// Frames waiting for the decoder: half a second at 60 FPS, enough to ride out a short
+/// stall (a game hitch) without dropping anything. Past that it is better to skip to a
+/// fresh keyframe than to show the stream seconds late (it used to hold 120 frames).
+const DECODE_QUEUE_FRAMES: usize = 30;
+use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use log::{info, warn};
+use slint::{Rgba8Pixel, SharedPixelBuffer};
+
+use super::types::*;
+use super::crypto::*;
+use super::signaling::*;
+use super::video_pipeline::*;
+use super::sources::*;
+use super::audio_loopback::*;
+
+pub struct ScreenCaptureManager {
+    is_running: Arc<AtomicBool>,
+    is_receiver_running: Arc<AtomicBool>,
+    channel_id: Arc<AtomicU64>,
+    my_user_id: Arc<AtomicU64>,
+    my_username: Arc<Mutex<String>>,
+    known_peers: Arc<Mutex<HashMap<u64, (SocketAddr, Instant)>>>,
+    shared_buffer: Arc<SharedFrameBuffer>,
+}
+
+impl ScreenCaptureManager {
+    pub fn new() -> Self {
+        Self {
+            is_running: Arc::new(AtomicBool::new(false)),
+            is_receiver_running: Arc::new(AtomicBool::new(false)),
+            channel_id: Arc::new(AtomicU64::new(0)),
+            my_user_id: Arc::new(AtomicU64::new(0)),
+            my_username: Arc::new(Mutex::new(String::new())),
+            known_peers: Arc::new(Mutex::new(HashMap::new())),
+            shared_buffer: Arc::new(SharedFrameBuffer::new()),
+        }
+    }
+
+    pub fn set_context(&self, channel_id: u64, my_user_id: u64, my_username: &str) {
+        self.channel_id.store(channel_id, Ordering::Relaxed);
+        self.my_user_id.store(my_user_id, Ordering::Relaxed);
+        if let Ok(mut uname) = self.my_username.lock() {
+            *uname = my_username.to_string();
+        }
+        notify_p2p_context_changed();
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.is_running.load(Ordering::Relaxed)
+    }
+
+    pub fn announce_presence(&self) {
+        let current_cid = self.channel_id.load(Ordering::Relaxed);
+        if current_cid == 0 { return; }
+        let mut my_uid = self.my_user_id.load(Ordering::Relaxed);
+        if my_uid == 0 {
+            my_uid = crate::gateway::get_my_user_id();
+            if my_uid > 0 {
+                self.my_user_id.store(my_uid, Ordering::Relaxed);
+            }
+        }
+        let my_instance_id = get_process_instance_id();
+        let my_rx = get_my_rx_port();
+        let mut uname = self.my_username.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if uname.is_empty() {
+            uname = crate::gateway::get_my_username();
+            if !uname.is_empty() {
+                *self.my_username.lock().unwrap_or_else(|e| e.into_inner()) = uname.clone();
+            }
+        }
+        let uname_bytes = uname.as_bytes();
+
+        let socket_opt = get_shared_p2p_socket().or_else(|| {
+            UdpSocket::bind("0.0.0.0:0").ok().map(|s| {
+                let _ = s.set_broadcast(true);
+                Arc::new(s)
+            })
+        });
+
+        if let Some(socket) = socket_opt {
+            let mut ack_pkt = Vec::with_capacity(30 + uname_bytes.len());
+            ack_pkt.extend_from_slice(MAGIC);
+            ack_pkt.extend_from_slice(&my_instance_id.to_be_bytes());
+            ack_pkt.push(OP_HEARTBEAT);
+            ack_pkt.extend_from_slice(&current_cid.to_be_bytes());
+            ack_pkt.extend_from_slice(&my_uid.to_be_bytes());
+            ack_pkt.push(0);
+            ack_pkt.push(2);
+            ack_pkt.push(uname_bytes.len() as u8);
+            ack_pkt.extend_from_slice(uname_bytes);
+            ack_pkt.extend_from_slice(&my_rx.to_be_bytes());
+
+            if let Ok(peers) = self.known_peers.lock() {
+                for (&_, &(addr, _)) in peers.iter() {
+                    let _ = socket.send_to(&ack_pkt, addr);
+                }
+            }
+            if let Ok(last_guard) = LAST_SEEN_PEER_ADDR.lock() {
+                if let Some(map) = last_guard.as_ref() {
+                    for (&p_uid, &addr) in map.iter() {
+                        if p_uid != my_uid {
+                            let _ = socket.send_to(&ack_pkt, addr);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn register_remote_peer(&self, uid: u64, addr: SocketAddr) {
+        if let Ok(mut peers) = self.known_peers.lock() {
+            peers.insert(uid, (addr, Instant::now()));
+            info!("🌐 Peer remoto P2P registrado: User ID {} -> {}", uid, addr);
+        }
+        request_intra_keyframe();
+        let current_cid = self.channel_id.load(Ordering::Relaxed);
+        let my_uid = self.my_user_id.load(Ordering::Relaxed);
+        let my_instance_id = get_process_instance_id();
+        let my_rx = get_my_rx_port();
+        let uname = self.my_username.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let uname_bytes = uname.as_bytes();
+
+        let socket_opt = get_shared_p2p_socket().or_else(|| {
+            UdpSocket::bind("0.0.0.0:0").ok().map(|s| {
+                let _ = s.set_broadcast(true);
+                Arc::new(s)
+            })
+        });
+
+        if let Some(socket) = socket_opt {
+            let mut ack_pkt = Vec::with_capacity(30 + uname_bytes.len());
+            ack_pkt.extend_from_slice(MAGIC);
+            ack_pkt.extend_from_slice(&my_instance_id.to_be_bytes());
+            ack_pkt.push(OP_HEARTBEAT);
+            ack_pkt.extend_from_slice(&current_cid.to_be_bytes());
+            ack_pkt.extend_from_slice(&my_uid.to_be_bytes());
+            ack_pkt.push(0);
+            ack_pkt.push(2);
+            ack_pkt.push(uname_bytes.len() as u8);
+            ack_pkt.extend_from_slice(uname_bytes);
+            ack_pkt.extend_from_slice(&my_rx.to_be_bytes());
+
+            for _ in 0..3 {
+                let _ = socket.send_to(&ack_pkt, addr);
+            }
+        }
+    }
+
+    pub fn shared_buffer(&self) -> Arc<SharedFrameBuffer> {
+        Arc::clone(&self.shared_buffer)
+    }
+
+    pub fn stop(&self) {
+        super::web_share::stop();
+        stop_window_border_overlay();
+        #[cfg(not(windows))]
+        {
+            PORTAL_INITIALIZED.store(false, Ordering::SeqCst);
+            if let Ok(mut slot) = PORTAL_FRAME.lock() {
+                *slot = None;
+            }
+            #[cfg(target_os = "linux")]
+            {
+                if let Ok(mut lock) = PORTAL_CHILD.lock() {
+                    if let Some(mut child) = lock.take() {
+                        let _ = child.kill();
+                    }
+                }
+                if let Ok(mut cb_slot) = PORTAL_LOCAL_CB.lock() {
+                    *cb_slot = None;
+                }
+            }
+        }
+        if self.is_running.swap(false, Ordering::SeqCst) {
+            #[cfg(windows)]
+            super::gpu_capture::stop();
+            #[cfg(windows)]
+            super::gpu_tx::end_stream();
+            // Viewers believe an OP_STOP only with this proof (taken before the key goes).
+            let stop_proof = super::watch::session_key().and_then(|k| super::watch::stop_proof(&k));
+            super::watch::end_session();
+            CURRENT_TX_FPS.store(0, Ordering::Relaxed);
+            info!("🛑 Parando captura e transmissão de tela P2P...");
+            let mut cid = self.channel_id.load(Ordering::Relaxed);
+            if cid == 0 {
+                cid = crate::gateway::get_my_voice_channel_id();
+            }
+            let mut uid = self.my_user_id.load(Ordering::Relaxed);
+            if uid == 0 {
+                uid = crate::gateway::get_my_user_id();
+            }
+
+            // 1. Notifica imediatamente o canal de sinalização Cloudflare para fechar o stream em <50ms
+            notify_signaling_stream_state(cid, uid, false);
+
+            let known_peers_clone = Arc::clone(&self.known_peers);
+            // 2. Dispara burst robusto em background thread para não travar a UI e garantir entrega sobre redes lentas/WAN
+            std::thread::Builder::new()
+                .name("p2p-stop-burst".to_string())
+                .spawn(move || {
+                    let socket_opt = get_shared_p2p_socket();
+                    let temp_sock;
+                    let sock_ref = if let Some(ref s) = socket_opt {
+                        s.as_ref()
+                    } else if let Ok(s) = UdpSocket::bind("0.0.0.0:0") {
+                        temp_sock = s;
+                        &temp_sock
+                    } else {
+                        return;
+                    };
+
+                    let inst = get_process_instance_id();
+                    let mut stop_pkt = Vec::with_capacity(25);
+                    stop_pkt.extend_from_slice(MAGIC);
+                    stop_pkt.extend_from_slice(&inst.to_be_bytes());
+                    stop_pkt.push(OP_STOP);
+                    stop_pkt.extend_from_slice(&cid.to_be_bytes());
+                    stop_pkt.extend_from_slice(&uid.to_be_bytes());
+                    if let Some(proof) = &stop_proof {
+                        stop_pkt.extend_from_slice(proof);
+                    }
+
+                    for _ in 0..10 {
+                        if let Ok(peers) = known_peers_clone.lock() {
+                            for (&_, &(addr, _)) in peers.iter() {
+                                let _ = sock_ref.send_to(&stop_pkt, addr);
+                            }
+                        }
+                        if let Ok(last_guard) = LAST_SEEN_PEER_ADDR.lock() {
+                            if let Some(map) = last_guard.as_ref() {
+                                for (&_p_uid, &addr) in map.iter() {
+                                    let _ = sock_ref.send_to(&stop_pkt, addr);
+                                }
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(60));
+                    }
+                })
+                .ok();
+        }
+    }
+
+    /// Starts the capture and UDP transmitter thread
+    pub fn start<F>(&self, target_hwnd: isize, screen_index: usize, camera_index: Option<u32>, res: i32, fps: i32, include_audio: bool, on_local_frame: F)
+    where
+        F: Fn(SharedPixelBuffer<Rgba8Pixel>) + Send + Sync + 'static,
+    {
+        if self.is_running.swap(true, Ordering::SeqCst) {
+            warn!("Transmissão de tela já está em execução.");
+            return;
+        }
+        // New stream: new key, nobody watching yet, full bitrate.
+        super::watch::start_session();
+        TX_WATCHED.store(false, Ordering::Relaxed);
+        #[cfg(windows)]
+        super::gpu_tx::begin_stream(
+            camera_index.is_none() && super::gpu_capture::choice() != super::gpu_capture::Choice::Cpu,
+        );
+        REQUESTED_BITRATE_BPS.store(MAX_STREAM_BITRATE, Ordering::Relaxed);
+        force_signaling_broadcast();
+
+        let on_local_arc: Arc<dyn Fn(SharedPixelBuffer<Rgba8Pixel>) + Send + Sync + 'static> = Arc::new(on_local_frame);
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(mut cb_slot) = PORTAL_LOCAL_CB.lock() {
+                *cb_slot = Some(Arc::clone(&on_local_arc));
+            }
+        }
+        let on_local_tx = Arc::clone(&on_local_arc);
+
+        let is_running = Arc::clone(&self.is_running);
+        let channel_id_atomic = Arc::clone(&self.channel_id);
+        let my_user_id_atomic = Arc::clone(&self.my_user_id);
+        let my_username_arc = Arc::clone(&self.my_username);
+        let peers_store = Arc::clone(&self.known_peers);
+        let buffer = Arc::clone(&self.shared_buffer);
+
+        let (target_w, target_h) = match res {
+            1080 => (1920u32, 1080u32),
+            480 => (854u32, 480u32),
+            _ => (1280u32, 720u32),
+        };
+        // Uncapped 60 FPS across all resolutions thanks to lightweight H.264 temporal compression
+        let target_fps = (fps.clamp(15, 60)) as u64;
+
+        if camera_index.is_none() && target_hwnd != 0 {
+            start_window_border_overlay(target_hwnd);
+        }
+
+        // Camera transmission is strictly without system loopback audio
+        if camera_index.is_none() && include_audio {
+            start_audio_loopback_tx(
+                Arc::clone(&self.is_running),
+                Arc::clone(&self.channel_id),
+                Arc::clone(&self.my_user_id),
+            );
+        }
+
+        info!("🖥️ Iniciando transmissão P2P H.264 ({}x{} @ {} FPS, screen_idx={}, hwnd={}, cam={:?}, audio={})...", target_w, target_h, target_fps, screen_index, target_hwnd, camera_index, camera_index.is_none() && include_audio);
+
+        std::thread::Builder::new()
+            .name("screen-capture-tx".to_string())
+            .spawn(move || {
+                let _fine_timer = crate::utils::timer_resolution::FineTimerGuard::new();
+                #[cfg(windows)]
+                unsafe {
+                    use ::windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+                    let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+                }
+                crate::cpu_profiler::set_current_thread_name("screen-capture-tx");
+                crate::utils::thread_priority::raise_current_thread();
+                *TX_THREAD.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::current());
+
+                // Created with the first CPU picture: when the GPU path works, never.
+                let mut h264_encoder: Option<Box<dyn crate::encoder::VideoEncoder>> = None;
+                #[cfg(windows)]
+                let mut gpu_encoder: Option<(usize, super::gpu_encode_worker::GpuEncodeWorker)> = None;
+                #[cfg(windows)]
+                let mut gpu_frame: Option<super::gpu_tx::GpuFrame> = None;
+
+                let socket = get_shared_p2p_socket().unwrap_or_else(|| {
+                    let s = UdpSocket::bind("0.0.0.0:0").unwrap();
+                    let _ = s.set_broadcast(true);
+                    let _ = s.set_nonblocking(true);
+                    Arc::new(s)
+                });
+
+                let (tx_frame, rx_frame) = std::sync::mpsc::sync_channel::<(Vec<u8>, u32, u32, u128, u128)>(6);
+                let (tx_recycle, rx_recycle) = std::sync::mpsc::sync_channel::<Vec<u8>>(6);
+                let is_running_cap = Arc::clone(&is_running);
+
+                #[cfg(windows)]
+                let rx_recycle_gpu = Arc::new(Mutex::new(rx_recycle));
+                #[cfg(windows)]
+                let selected_gpu_started = camera_index.is_none() && {
+                    use windows_capture::monitor::Monitor;
+                    let monitor = Monitor::enumerate().ok().and_then(|m| m.into_iter().nth(screen_index))
+                        .or_else(|| Monitor::primary().ok());
+                    monitor.is_some_and(|m| super::gpu_capture::start(super::gpu_capture::Request {
+                        hwnd: target_hwnd, monitor: m.as_raw_hmonitor() as isize,
+                        width: target_w, height: target_h, fps: target_fps,
+                        is_running: Arc::clone(&is_running), tx_frame: tx_frame.clone(),
+                        rx_recycle: Arc::clone(&rx_recycle_gpu),
+                    }))
+                };
+
+                // =========================================================================
+                // ESTÁGIO 1: Captura Windows Graphics Capture (WGC - GPU Direct 60-100 FPS)
+                // =========================================================================
+                #[cfg(windows)]
+                let wgc_started = if selected_gpu_started {
+                    true
+                } else if camera_index.is_none() {
+                    use windows_capture::{
+                        capture::{Context, GraphicsCaptureApiHandler},
+                        frame::Frame,
+                        graphics_capture_api::InternalCaptureControl,
+                        monitor::Monitor,
+                        window::Window,
+                        settings::{
+                            ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
+                            MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
+                        },
+                    };
+
+                    struct WgcHandler {
+                        tx_frame: std::sync::mpsc::SyncSender<(Vec<u8>, u32, u32, u128, u128)>,
+                        rx_recycle: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<Vec<u8>>>>,
+                        is_running: Arc<AtomicBool>,
+                        target_w: u32,
+                        target_h: u32,
+                        /// When a frame was last copied out of the GPU.
+                        last_copy: Option<Instant>,
+                        gpu: super::gpu_tx::CaptureSide,
+                    }
+
+                    struct WgcFlags {
+                        tx_frame: std::sync::mpsc::SyncSender<(Vec<u8>, u32, u32, u128, u128)>,
+                        rx_recycle: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<Vec<u8>>>>,
+                        is_running: Arc<AtomicBool>,
+                        target_fps: u64,
+                        target_w: u32,
+                        target_h: u32,
+                    }
+
+                    impl GraphicsCaptureApiHandler for WgcHandler {
+                        type Flags = WgcFlags;
+                        type Error = Box<dyn std::error::Error + Send + Sync>;
+
+                        fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
+                            Ok(Self {
+                                tx_frame: ctx.flags.tx_frame,
+                                rx_recycle: ctx.flags.rx_recycle,
+                                is_running: ctx.flags.is_running,
+                                target_w: ctx.flags.target_w,
+                                target_h: ctx.flags.target_h,
+                                last_copy: None,
+                                gpu: super::gpu_tx::CaptureSide::new(ctx.flags.target_w, ctx.flags.target_h),
+                            })
+                        }
+
+                        fn on_frame_arrived(
+                            &mut self,
+                            frame: &mut Frame,
+                            capture_control: InternalCaptureControl,
+                        ) -> Result<(), Self::Error> {
+                            if !self.is_running.load(Ordering::Relaxed) {
+                                capture_control.stop();
+                                return Ok(());
+                            }
+
+                            // The GPU path: the texture never leaves the GPU.
+                            let device: *mut std::ffi::c_void = unsafe { std::mem::transmute_copy(frame.device()) };
+                            let texture: *mut std::ffi::c_void = unsafe { std::mem::transmute_copy(frame.as_raw_texture()) };
+                            if self.gpu.handle(device, texture, TX_WATCHED.load(Ordering::Relaxed)) {
+                                return Ok(());
+                            }
+                            // Copying the frame out of the GPU is the costly part: while nobody
+                            // watches, only as often as the local preview needs.
+                            if !TX_WATCHED.load(Ordering::Relaxed) && self.last_copy.is_some_and(|t| t.elapsed() < IDLE_FRAME_INTERVAL) {
+                                return Ok(());
+                            }
+                            self.last_copy = Some(Instant::now());
+                            let (w, h) = (frame.width(), frame.height());
+                            if let Ok(mut fb) = frame.buffer() {
+                                let slice = fb.as_raw_buffer();
+                                let canvas_w = self.target_w;
+                                let canvas_h = self.target_h;
+                                let total_canvas_bytes = (canvas_w * canvas_h * 4) as usize;
+
+                                let mut cur_buf = if let Ok(rx) = self.rx_recycle.lock() {
+                                    rx.try_recv().unwrap_or_else(|_| Vec::with_capacity(total_canvas_bytes))
+                                } else {
+                                    Vec::with_capacity(total_canvas_bytes)
+                                };
+                                if cur_buf.len() != total_canvas_bytes {
+                                    cur_buf.resize(total_canvas_bytes, 0);
+                                }
+
+                                fit_bgra_to_canvas(slice, w, h, canvas_w, canvas_h, &mut cur_buf);
+                                let _ = self.tx_frame.try_send((cur_buf, canvas_w, canvas_h, 0, 0));
+                            }
+                            Ok(())
+                        }
+
+                        fn on_closed(&mut self) -> Result<(), Self::Error> {
+                            Ok(())
+                        }
+                    }
+
+                    let rx_recycle_arc = Arc::clone(&rx_recycle_gpu);
+                    let flags = WgcFlags {
+                        tx_frame: tx_frame.clone(),
+                        rx_recycle: Arc::clone(&rx_recycle_arc),
+                        is_running: Arc::clone(&is_running),
+                        target_fps,
+                        target_w,
+                        target_h,
+                    };
+
+                    let tx_frame_fallback = tx_frame.clone();
+                    let is_running_fallback = Arc::clone(&is_running);
+                    let mut started = false;
+
+                    if target_hwnd != 0 {
+                        let win = Window::from_raw_hwnd(target_hwnd as *mut std::ffi::c_void);
+                        let settings = Settings::new(
+                            win,
+                            CursorCaptureSettings::Default,
+                            DrawBorderSettings::WithoutBorder,
+                            SecondaryWindowSettings::Default,
+                            MinimumUpdateIntervalSettings::Default,
+                            DirtyRegionSettings::Default,
+                            ColorFormat::Bgra8,
+                            flags,
+                        );
+                        std::thread::Builder::new()
+                            .name("wgc-capture-thread".to_string())
+                            .spawn(move || {
+                                info!("⚡ Iniciando Windows Graphics Capture (WGC) para Janela HWND={}", target_hwnd);
+                                if let Err(e) = WgcHandler::start(settings) {
+                                    warn!("⚠️ WGC falhou ({:?}), acionando fallback GDI...", e);
+                                    let mut cur_buf = Vec::with_capacity((target_w * target_h * 4) as usize);
+                                    let frame_interval = Duration::from_nanos(1_000_000_000 / target_fps.max(1));
+                                    while is_running_fallback.load(Ordering::Relaxed) {
+                                        let t_start = Instant::now();
+                                        if let Some((blt, pix)) = capture_screen_rgb(target_hwnd, target_w, target_h, target_fps, &mut cur_buf) {
+                                            let _ = tx_frame_fallback.try_send((cur_buf.clone(), target_w, target_h, blt, pix));
+                                        }
+                                        let el = t_start.elapsed();
+                                        let pace = capture_pace(frame_interval);
+                                        if el < pace {
+                                            std::thread::sleep(pace - el);
+                                        }
+                                    }
+                                }
+                            })
+                            .ok();
+                        started = true;
+                    } else {
+                        let monitor_opt = if let Ok(monitors) = Monitor::enumerate() {
+                            monitors.into_iter().nth(screen_index).or_else(|| Monitor::primary().ok())
+                        } else {
+                            Monitor::primary().ok()
+                        };
+
+                        if let Some(monitor) = monitor_opt {
+                            let mon_name = monitor.name().unwrap_or_else(|_| format!("Monitor #{}", screen_index + 1));
+                            use windows_capture::dxgi_duplication_api::DxgiDuplicationApi;
+
+                            let tx_frame_dxgi = tx_frame.clone();
+                            let rx_recycle_dxgi = Arc::clone(&rx_recycle_arc);
+                            let is_running_dxgi = Arc::clone(&is_running);
+                            let tx_frame_fallback_inner = tx_frame_fallback.clone();
+                            let is_running_fallback_inner = Arc::clone(&is_running_fallback);
+
+                            std::thread::Builder::new()
+                                .name("dxgi-duplication-thread".to_string())
+                                .spawn(move || {
+                                    crate::cpu_profiler::set_current_thread_name("dxgi-duplication-thread");
+                                    info!("⚡ [SUNSHINE GPU ENGINE] Tentando DXGI Desktop Duplication Direto na GPU para {}...", mon_name);
+                                    let mut dup_opt = DxgiDuplicationApi::new(monitor).ok();
+                                    let dxgi_ok = dup_opt.is_some();
+
+                                    if dxgi_ok {
+                                        info!("🚀 [SUNSHINE GPU ENGINE] DXGI Desktop Duplication ATIVADO com sucesso na GPU! (Zero-Copy VRAM 60 FPS)");
+                                        let canvas_w = target_w;
+                                        let canvas_h = target_h;
+                                        let total_canvas_bytes = (canvas_w * canvas_h * 4) as usize;
+                                        let frame_interval = Duration::from_nanos(1_000_000_000 / target_fps.max(1));
+                                        let mut gpu_side = super::gpu_tx::CaptureSide::new(canvas_w, canvas_h);
+
+                                        while is_running_dxgi.load(Ordering::Relaxed) {
+                                            let t_start = Instant::now();
+                                            if let Some(mut dup) = dup_opt.take() {
+                                                match dup.acquire_next_frame(20) {
+                                                    Ok(mut frame) => {
+                                                        let (w, h) = (frame.width(), frame.height());
+                                                        let device: *mut std::ffi::c_void = unsafe { std::mem::transmute_copy(frame.device()) };
+                                                        let texture: *mut std::ffi::c_void = unsafe { std::mem::transmute_copy(frame.texture()) };
+                                                        let on_gpu = gpu_side.handle(device, texture, TX_WATCHED.load(Ordering::Relaxed));
+                                                        if on_gpu {
+                                                            // Handled on the GPU.
+                                                        } else if let Ok(mut fb) = frame.buffer() {
+                                                            let slice = fb.as_raw_buffer();
+                                                            let mut cur_buf = if let Ok(rx) = rx_recycle_dxgi.lock() {
+                                                                rx.try_recv().unwrap_or_else(|_| Vec::with_capacity(total_canvas_bytes))
+                                                            } else {
+                                                                Vec::with_capacity(total_canvas_bytes)
+                                                            };
+                                                            if cur_buf.len() != total_canvas_bytes {
+                                                                cur_buf.resize(total_canvas_bytes, 0);
+                                                            }
+
+                                                            fit_bgra_to_canvas(slice, w, h, canvas_w, canvas_h, &mut cur_buf);
+                                                            let _ = tx_frame_dxgi.try_send((cur_buf, canvas_w, canvas_h, 0, 0));
+                                                        }
+                                                        dup_opt = Some(dup);
+                                                    }
+                                                    Err(windows_capture::dxgi_duplication_api::Error::Timeout) => {
+                                                        // Screen static: nothing to do, CFR pacer will handle frame rate
+                                                        dup_opt = Some(dup);
+                                                    }
+                                                    Err(windows_capture::dxgi_duplication_api::Error::AccessLost) => {
+                                                        warn!("⚠️ [DXGI GPU] Access Lost (troca de modo D3D11 / UAC), recriando sessão...");
+                                                        dup_opt = dup.recreate().ok().or_else(|| DxgiDuplicationApi::new(monitor).ok());
+                                                        if dup_opt.is_none() {
+                                                            std::thread::sleep(Duration::from_millis(50));
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("⚠️ [DXGI GPU] Erro na duplicação DXGI ({:?}), tentando recriar...", e);
+                                                        dup_opt = dup.recreate().ok().or_else(|| DxgiDuplicationApi::new(monitor).ok());
+                                                        if dup_opt.is_none() {
+                                                            std::thread::sleep(Duration::from_millis(50));
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                dup_opt = DxgiDuplicationApi::new(monitor).ok();
+                                                if dup_opt.is_none() {
+                                                    std::thread::sleep(Duration::from_millis(100));
+                                                }
+                                            }
+
+                                            let el = t_start.elapsed();
+
+                                            let pace = capture_pace(frame_interval);
+
+                                            if el < pace {
+
+                                                std::thread::sleep(pace - el);
+
+                                            }
+                                        }
+                                    }
+
+                                    if !dxgi_ok {
+                                        warn!("⚠️ [DXGI GPU] DXGI Duplication indisponível para este monitor, iniciando Windows Graphics Capture (WGC)...");
+                                        let settings = Settings::new(
+                                            monitor,
+                                            CursorCaptureSettings::Default,
+                                            DrawBorderSettings::WithoutBorder,
+                                            SecondaryWindowSettings::Default,
+                                            MinimumUpdateIntervalSettings::Default,
+                                            DirtyRegionSettings::Default,
+                                            ColorFormat::Bgra8,
+                                            flags,
+                                        );
+                                        if let Err(e) = WgcHandler::start(settings) {
+                                            warn!("⚠️ WGC falhou ({:?}), acionando fallback GDI...", e);
+                                            let mut cur_buf = Vec::with_capacity((target_w * target_h * 4) as usize);
+                                            let frame_interval = Duration::from_nanos(1_000_000_000 / target_fps.max(1));
+                                            while is_running_fallback_inner.load(Ordering::Relaxed) {
+                                                let t_start = Instant::now();
+                                                if let Some((blt, pix)) = capture_screen_rgb(0, target_w, target_h, target_fps, &mut cur_buf) {
+                                                    let _ = tx_frame_fallback_inner.try_send((cur_buf.clone(), target_w, target_h, blt, pix));
+                                                }
+                                                let el = t_start.elapsed();
+                                                let pace = capture_pace(frame_interval);
+                                                if el < pace {
+                                                    std::thread::sleep(pace - el);
+                                                }
+                                            }
+                                        }
+                                    }
+                                })
+                                .ok();
+                            started = true;
+                        }
+                    }
+                    started
+                } else {
+                    false
+                };
+
+                #[cfg(not(windows))]
+                let wgc_started = false;
+
+                if !wgc_started {
+                    // Fallback para Câmera ou Captura Tradicional
+                    std::thread::Builder::new()
+                        .name("screen-capture-worker".to_string())
+                        .spawn(move || {
+                            let _fine_timer = crate::utils::timer_resolution::FineTimerGuard::new();
+
+                            let camera_handle = if let Some(cam_idx) = camera_index {
+                                info!("📷 [CAMERA WORKER] Buscando câmeras disponíveis na thread dedicada (índice selecionado: {})...", cam_idx);
+                                match cameras::devices() {
+                                    Ok(devs) => {
+                                        info!("📷 [CAMERA WORKER] {} dispositivo(s) de câmera encontrado(s) no sistema", devs.len());
+                                        for (i, d) in devs.iter().enumerate() {
+                                            info!("📷 [CAMERA WORKER] Dev #{}: '{}' (id: '{:?}')", i, d.name, d.id);
+                                        }
+                                        if let Some(dev) = devs.into_iter().nth(cam_idx as usize) {
+                                            let cam_w = target_w.min(1280);
+                                            let cam_h = target_h.min(720);
+                                            let cam_fps = (target_fps as u32).min(60);
+                                            let mut opened = None;
+                                            let formats = [
+                                                cameras::PixelFormat::Mjpeg,
+                                                cameras::PixelFormat::Bgra8,
+                                                cameras::PixelFormat::Rgba8,
+                                                cameras::PixelFormat::Yuyv,
+                                                cameras::PixelFormat::Rgb8,
+                                            ];
+                                            let resolutions = [
+                                                cameras::Resolution { width: cam_w, height: cam_h },
+                                                cameras::Resolution { width: 1280, height: 720 },
+                                                cameras::Resolution { width: 640, height: 480 },
+                                                cameras::Resolution { width: 640, height: 360 },
+                                                cameras::Resolution { width: 1920, height: 1080 },
+                                            ];
+                                            let framerates = [cam_fps, 30, 15, 10];
+                                            'outer: for fmt in formats {
+                                                for res_test in resolutions {
+                                                    for fps_test in framerates {
+                                                        let config = cameras::StreamConfig {
+                                                            resolution: res_test,
+                                                            framerate: fps_test,
+                                                            pixel_format: fmt,
+                                                        };
+                                                        match cameras::open(&dev, config) {
+                                                            Ok(cam) => {
+                                                                info!("📷 [CAMERA WORKER] Câmera '{}' aberta com sucesso ({}x{} @ {} FPS, {:?})!", dev.name, res_test.width, res_test.height, fps_test, fmt);
+                                                                opened = Some(cam);
+                                                                break 'outer;
+                                                            }
+                                                            Err(_e) => {}
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if opened.is_none() {
+                                                warn!("⚠️ [CAMERA WORKER] Failed to open camera '{}' em todos os formatos de pixel testados.", dev.name);
+                                            }
+                                            opened
+                                        } else {
+                                            warn!("⚠️ [CAMERA WORKER] Câmera índice {} fora do alcance de dispositivos disponíveis", cam_idx);
+                                            None
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("⚠️ [CAMERA WORKER] Error listing camera devices: {:?}", e);
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+
+                            let frame_interval = Duration::from_nanos(1_000_000_000 / (target_fps as u64).max(1));
+                            let mut next_cap_time = Instant::now() + frame_interval;
+
+                            while is_running_cap.load(Ordering::Relaxed) {
+                                let mut cur_buf = Vec::with_capacity((target_w * target_h * 4) as usize);
+
+                                let cap_res = if camera_index.is_some() {
+                                    if let Some(ref cam) = camera_handle {
+                                        if let Ok(frame) = cameras::next_frame(cam, Duration::from_millis(200)) {
+                                            let (w, h) = (frame.width, frame.height);
+                                            let converted = std::panic::catch_unwind(|| {
+                                                cameras::to_rgba8(&frame)
+                                            });
+                                            if let Ok(Ok(mut rgba_bytes)) = converted {
+                                                for chunk in rgba_bytes.chunks_exact_mut(4) {
+                                                    chunk.swap(0, 2); // RGBA -> BGRA
+                                                }
+                                                let total_canvas_bytes = (target_w * target_h * 4) as usize;
+                                                cur_buf.resize(total_canvas_bytes, 0);
+                                                fit_bgra_to_canvas(&rgba_bytes, w, h, target_w, target_h, &mut cur_buf);
+                                                Some((target_w, target_h, 0u128, 0u128))
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    capture_screen_rgb(target_hwnd, target_w, target_h, target_fps, &mut cur_buf)
+                                        .map(|(blt, pix)| (target_w, target_h, blt, pix))
+                                };
+
+                                if let Some((w, h, blt, pix)) = cap_res {
+                                    let _ = tx_frame.try_send((cur_buf, w, h, blt, pix));
+                                }
+
+                                // Nobody watching: only the local preview uses frames (4 per second).
+                                let frame_interval = if TX_WATCHED.load(Ordering::Relaxed) { frame_interval } else { IDLE_FRAME_INTERVAL };
+                                let now = Instant::now();
+                                if now < next_cap_time {
+                                    let rem = next_cap_time - now;
+                                    std::thread::sleep(rem);
+                                    next_cap_time += frame_interval;
+                                } else {
+                                    if now - next_cap_time > Duration::from_millis(100) {
+                                        next_cap_time = now + frame_interval;
+                                    } else {
+                                        next_cap_time += frame_interval;
+                                    }
+                                }
+                            }
+                        })
+                        .ok();
+                }
+
+                // =========================================================================
+                // ESTÁGIO 2: Worker de Encode OpenH264 e Emissão UDP (Em Paralelo)
+                // =========================================================================
+                let mut tx_frame_count = 0u64;
+                let mut last_tx_stats = std::time::Instant::now();
+                let mut total_encode_us = 0u128;
+                let mut total_preview_us = 0u128;
+                let mut total_crypt_us = 0u128;
+                let mut total_fec_us = 0u128;
+                let mut total_net_us = 0u128;
+                let mut total_blt_us = 0u128;
+                let mut total_pix_us = 0u128;
+                // Pacing: how long the waits between frames asked for and actually took, and
+                // the slowest loop turn, to tell a slow encoder from late wake-ups.
+                let mut total_park_asked_us = 0u128;
+                let mut total_park_us = 0u128;
+                let mut max_turn_us = 0u128;
+                // Pictures the capture delivered (the loop re-encodes the last one otherwise).
+                let mut new_captures = 0u32;
+                // A picture arrived since the last encode, when the last one arrived, and
+                // when the last encode was.
+                let mut fresh_picture = false;
+                let mut last_fresh = Instant::now();
+                let mut last_encode = Instant::now() - STILL_REPEAT_EVERY;
+                let mut turn_start = Instant::now();
+                let mut last_local_preview = Instant::now() - Duration::from_secs(1);
+                let mut last_announce = Instant::now() - Duration::from_secs(10);
+                let mut last_idr = Instant::now() - Duration::from_secs(10);
+                let mut frame_seq: u32 = 0;
+
+                let frame_target_interval = Duration::from_micros(1_000_000 / target_fps.max(1));
+                let mut next_tick = Instant::now();
+                let mut latest_cached_frame: Option<(Vec<u8>, u32, u32, u128, u128)> = None;
+                let mut rate = super::watch::RateControl::new(MAX_STREAM_BITRATE);
+                let mut last_rate_update = Instant::now();
+                let mut was_watched = false;
+
+                while is_running.load(Ordering::Relaxed) {
+                    let mut cid = channel_id_atomic.load(Ordering::Relaxed);
+                    if cid == 0 {
+                        cid = crate::gateway::get_my_voice_channel_id();
+                        if cid > 0 {
+                            channel_id_atomic.store(cid, Ordering::Relaxed);
+                        }
+                    }
+                    let mut uid = my_user_id_atomic.load(Ordering::Relaxed);
+                    if uid == 0 {
+                        uid = crate::gateway::get_my_user_id();
+                        if uid > 0 {
+                            my_user_id_atomic.store(uid, Ordering::Relaxed);
+                        }
+                    }
+
+                    // Announce presence periodically
+                    if last_announce.elapsed() > Duration::from_millis(1500) {
+                        let uname = my_username_arc.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        let uname_bytes = uname.as_bytes();
+                        let my_rx = get_my_rx_port();
+                        let inst = get_process_instance_id();
+                        let mut ann_pkt = Vec::with_capacity(32 + uname_bytes.len());
+                        ann_pkt.extend_from_slice(MAGIC);
+                        ann_pkt.extend_from_slice(&inst.to_be_bytes());
+                        ann_pkt.push(OP_ANNOUNCE);
+                        ann_pkt.extend_from_slice(&cid.to_be_bytes());
+                        ann_pkt.extend_from_slice(&uid.to_be_bytes());
+                        ann_pkt.push(1);
+                        ann_pkt.push(match res {
+                            1080 => 108,
+                            480 => 48,
+                            _ => 72,
+                        });
+                        ann_pkt.push(target_fps as u8);
+                        ann_pkt.push(uname_bytes.len() as u8);
+                        ann_pkt.extend_from_slice(uname_bytes);
+                        ann_pkt.extend_from_slice(&my_rx.to_be_bytes());
+
+                        if let Ok(peers) = peers_store.lock() {
+                            for (&_, &(addr, _)) in peers.iter() {
+                                let _ = socket.send_to(&ann_pkt, addr);
+                            }
+                        }
+                        if let Ok(last_guard) = LAST_SEEN_PEER_ADDR.lock() {
+                            if let Some(map) = last_guard.as_ref() {
+                                for (&p_uid, &addr) in map.iter() {
+                                    if p_uid != uid {
+                                        let _ = socket.send_to(&ann_pkt, addr);
+                                    }
+                                }
+                            }
+                        }
+                        last_announce = Instant::now();
+                    }
+
+                    #[cfg(windows)]
+                    if let Some(f) = super::gpu_tx::take_latest() {
+                        gpu_frame = Some(f);
+                        new_captures += 1;
+                        fresh_picture = true;
+                        last_fresh = Instant::now();
+                    }
+                    #[cfg(windows)]
+                    if let Some((device, w, h)) = super::gpu_tx::take_new_device() {
+                        open_gpu_encoder(&mut gpu_encoder, &device, w, h, target_fps as u32);
+                    }
+                    #[cfg(windows)]
+                    let gpu_path = super::gpu_tx::active();
+                    #[cfg(not(windows))]
+                    let gpu_path = false;
+
+                    // Drena quadros novos da GPU para sempre ter o frame mais atualizado
+                    while let Ok(new_frame) = rx_frame.try_recv() {
+                        new_captures += 1;
+                        fresh_picture = true;
+                        last_fresh = Instant::now();
+                        if let Some((old_buf, _, _, _, _)) = latest_cached_frame.replace(new_frame) {
+                            let _ = tx_recycle.try_send(old_buf);
+                        }
+                    }
+
+                    // Se nenhum quadro chegou ainda, aguarda até 20ms ou usa fallback GDI imediato para captura de tela (vital para notebooks com GPUs híbridas)
+                    if latest_cached_frame.is_none() && !gpu_path {
+                        match rx_frame.recv_timeout(Duration::from_millis(20)) {
+                            Ok(first_frame) => {
+                                latest_cached_frame = Some(first_frame);
+                            }
+                            Err(_) => {
+                                if camera_index.is_none() {
+                                    #[cfg(windows)]
+                                    {
+                                        let mut cur_buf = Vec::with_capacity((target_w * target_h * 4) as usize);
+                                        if let Some((blt, pix)) = capture_screen_rgb(target_hwnd, target_w, target_h, target_fps, &mut cur_buf) {
+                                            latest_cached_frame = Some((cur_buf, target_w, target_h, blt, pix));
+                                        } else {
+                                            continue;
+                                        }
+                                    }
+                                    #[cfg(not(windows))]
+                                    continue;
+                                } else {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    // Pacer CFR de precisão (Sem busy spinloop para 0% CPU overhead)
+                    // Nobody watching: the preview's pace (a new viewer is noticed within it).
+                    let frame_target_interval = if was_watched { frame_target_interval } else { IDLE_FRAME_INTERVAL };
+                    let now = Instant::now();
+                    if now < next_tick {
+                        let sleep_dur = (next_tick - now).min(frame_target_interval);
+                        // Woken early when a viewer arrives (wake_tx), instead of a full idle tick.
+                        std::thread::park_timeout(sleep_dur);
+                        total_park_asked_us += sleep_dur.as_micros();
+                        total_park_us += now.elapsed().as_micros();
+                    }
+                    next_tick += frame_target_interval;
+                    if now > next_tick + frame_target_interval * 2 {
+                        next_tick = now + frame_target_interval;
+                    }
+
+                    // On the GPU path the pictures (and the preview) stay on the GPU: the loop goes
+                    // on without a CPU copy, so it keeps noticing viewers.
+                    let cpu_frame = if gpu_path {
+                        None
+                    } else {
+                        match latest_cached_frame {
+                            Some(ref f) => Some((f.0.as_slice(), f.1, f.2, f.3, f.4)),
+                            None => continue,
+                        }
+                    };
+                    if let Some((_, _, _, blt_us, pix_us)) = cpu_frame {
+                        total_blt_us += blt_us;
+                        total_pix_us += pix_us;
+                    }
+
+                    let t_preview_start = Instant::now();
+                    #[cfg(windows)]
+                    if gpu_path {
+                        if let Some(p) = super::gpu_tx::take_preview() {
+                            buffer.publish(p.clone());
+                            on_local_tx(p);
+                        }
+                    }
+                    // Decouple UI local preview with fast downsampler (480w) to eliminate UI thread lag and memory overhead
+                    if let Some((bgra_slice, cur_w, cur_h, _, _)) = cpu_frame.filter(|_| last_local_preview.elapsed() >= Duration::from_millis(250)) {
+                        if (camera_index.is_some() || cfg!(windows)) && cur_w > 0 && cur_h > 0 {
+                            let prev_w = 480u32.min(cur_w);
+                            let prev_h = (((prev_w as f32 / cur_w as f32) * (cur_h as f32)).round() as u32).max(1);
+
+                            let mut pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::new(prev_w, prev_h);
+                            let slice = pixel_buffer.make_mut_slice();
+
+                            let x_step = ((cur_w as u64) << 16) / (prev_w as u64);
+                            let y_step = ((cur_h as u64) << 16) / (prev_h as u64);
+
+                            let src_u32: &[u32] = unsafe {
+                                std::slice::from_raw_parts(bgra_slice.as_ptr() as *const u32, (cur_w * cur_h) as usize)
+                            };
+
+                            let mut src_y_accum = 0u64;
+                            for dy in 0..prev_h {
+                                let sy = ((src_y_accum >> 16) as usize).min((cur_h as usize).saturating_sub(1));
+                                let src_row_start = sy * (cur_w as usize);
+                                let src_row_end = (src_row_start + (cur_w as usize)).min(src_u32.len());
+                                if src_row_start >= src_u32.len() {
+                                    break;
+                                }
+                                let src_row = &src_u32[src_row_start..src_row_end];
+                                let dst_row_start = (dy * prev_w) as usize;
+
+                                let mut src_x_accum = 0u64;
+                                for dx in 0..(prev_w as usize) {
+                                    let sx = ((src_x_accum >> 16) as usize).min(src_row.len().saturating_sub(1));
+                                    if sx < src_row.len() && dst_row_start + dx < slice.len() {
+                                        let bgra_val = src_row[sx];
+                                        let b = (bgra_val & 0xFF) as u8;
+                                        let g = ((bgra_val >> 8) & 0xFF) as u8;
+                                        let r = ((bgra_val >> 16) & 0xFF) as u8;
+                                        slice[dst_row_start + dx] = Rgba8Pixel::new(r, g, b, 255);
+                                    }
+                                    src_x_accum += x_step;
+                                }
+                                src_y_accum += y_step;
+                            }
+
+                            buffer.publish(pixel_buffer.clone());
+                            on_local_tx(pixel_buffer);
+                        }
+                        last_local_preview = Instant::now();
+                    }
+                    let t_preview_us = t_preview_start.elapsed().as_micros();
+                    total_preview_us += t_preview_us;
+
+                    if last_rate_update.elapsed() >= Duration::from_secs(1) {
+                        last_rate_update = Instant::now();
+                        let before = rate.current();
+                        let bps = rate.update(super::watch::worst_loss(), last_rate_update);
+                        if bps != before {
+                            info!("📶 [ABR] Taxa da transmissão: {:.1} -> {:.1} Mbps (pior perda entre espectadores: {:?}‰)", before as f64 / 1e6, bps as f64 / 1e6, super::watch::worst_loss());
+                        }
+                        REQUESTED_BITRATE_BPS.store(bps, Ordering::Relaxed);
+                    }
+
+                    // Nobody watching (natively or in a browser): no encoding, nothing sent.
+                    // The first viewer to arrive asks for a keyframe.
+                    let viewer_addrs = super::watch::viewer_addrs();
+                    let watched = !viewer_addrs.is_empty() || super::web_share::viewer_count() > 0;
+                    if watched != was_watched {
+                        was_watched = watched;
+                        TX_WATCHED.store(watched, Ordering::Relaxed);
+                        info!("👀 [ASSISTIR SOB DEMANDA] {}", if watched { "Alguém começou a assistir: codificando." } else { "Ninguém assistindo: codificação pausada." });
+                    }
+
+                    // A still screen is not encoded again on every tick: a repeat goes out
+                    // every STILL_REPEAT_EVERY, and anything new or a keyframe at once.
+                    // While pictures keep coming, a tick the capture missed is still
+                    // filled with a repeat, so the pace stays even.
+                    let encode_now = fresh_picture
+                        || last_fresh.elapsed() < STILL_REPEAT_EVERY
+                        || last_encode.elapsed() >= STILL_REPEAT_EVERY
+                        || KEYFRAME_REQUESTED.load(Ordering::Relaxed);
+                    if watched && encode_now {
+                        fresh_picture = false;
+                        last_encode = Instant::now();
+                    }
+                    let enc_start = Instant::now();
+                    let frame_bytes_opt = if !watched {
+                        None
+                    } else if gpu_path {
+                        #[cfg(windows)]
+                        {
+                            if encode_now {
+                                encode_on_gpu(&mut gpu_encoder, gpu_frame.as_ref(), target_fps as u32)
+                            } else {
+                                finished_on_gpu(&mut gpu_encoder)
+                            }
+                        }
+                        #[cfg(not(windows))]
+                        None
+                    } else if let Some((bgra_slice, cur_w, cur_h, _, _)) = cpu_frame.filter(|_| encode_now) {
+                        let enc = h264_encoder.get_or_insert_with(|| crate::encoder::create_best_encoder(target_fps as u32, camera_index.is_none()));
+                        let target_bitrate = REQUESTED_BITRATE_BPS.load(Ordering::Relaxed);
+                        if enc.get_bitrate_bps() != target_bitrate {
+                            enc.set_bitrate_bps(target_bitrate);
+                        }
+                        if KEYFRAME_REQUESTED.swap(false, Ordering::Relaxed) || last_idr.elapsed() >= Duration::from_millis(2000) {
+                            last_idr = Instant::now();
+                            enc.force_intra_frame();
+                        }
+                        enc.encode(bgra_slice, cur_w, cur_h)
+                    } else {
+                        None
+                    };
+                    let enc_dur = enc_start.elapsed().as_micros();
+                    total_encode_us += enc_dur;
+
+                    if let Some(raw_frame_bytes) = frame_bytes_opt {
+                        // Browsers watching over WebRTC get the same encoded frame.
+                        super::web_share::offer_frame(&raw_frame_bytes);
+                        let t_crypt_start = Instant::now();
+                        let Some(frame_bytes) = super::watch::session_key().and_then(|k| encrypt_signaling_payload(&k, &raw_frame_bytes)) else {
+                            continue;
+                        };
+                        let t_crypt_us = t_crypt_start.elapsed().as_micros();
+                        total_crypt_us += t_crypt_us;
+
+                        frame_seq = frame_seq.wrapping_add(1);
+                        let total_len = frame_bytes.len();
+                        let total_chunks = ((total_len + CHUNK_SIZE - 1) / CHUNK_SIZE) as u16;
+
+                        // Only the viewers that asked for this stream (each at the address its
+                        // request came from).
+                        let target_addrs = viewer_addrs;
+
+                        let t_fec_start = Instant::now();
+                        // Compute Sunshine-grade Forward Error Correction (FEC) XOR parity
+                        let fec_parity = if total_chunks > 1 {
+                            let mut p = vec![0u8; CHUNK_SIZE];
+                            for c_idx in 0..total_chunks {
+                                let start = (c_idx as usize) * CHUNK_SIZE;
+                                let end = (start + CHUNK_SIZE).min(total_len);
+                                let slice = &frame_bytes[start..end];
+                                for (i, &b) in slice.iter().enumerate() {
+                                    p[i] ^= b;
+                                }
+                            }
+                            Some(p)
+                        } else {
+                            None
+                        };
+                        let t_fec_us = t_fec_start.elapsed().as_micros();
+                        total_fec_us += t_fec_us;
+
+                        let pts_ms = get_tx_pts_ms();
+                        let t_net_start = Instant::now();
+
+                        for chunk_idx in 0..total_chunks {
+                            let start = (chunk_idx as usize) * CHUNK_SIZE;
+                            let end = (start + CHUNK_SIZE).min(total_len);
+                            let chunk_slice = &frame_bytes[start..end];
+
+                            let inst = get_process_instance_id();
+                            let mut pkt = Vec::with_capacity(37 + chunk_slice.len());
+                            pkt.extend_from_slice(MAGIC);
+                            pkt.extend_from_slice(&inst.to_be_bytes());
+                            pkt.push(OP_VIDEO_CHUNK);
+                            pkt.extend_from_slice(&cid.to_be_bytes());
+                            pkt.extend_from_slice(&uid.to_be_bytes());
+                            pkt.extend_from_slice(&frame_seq.to_be_bytes());
+                            pkt.extend_from_slice(&pts_ms.to_be_bytes());
+                            pkt.extend_from_slice(&total_chunks.to_be_bytes());
+                            pkt.extend_from_slice(&chunk_idx.to_be_bytes());
+                            pkt.extend_from_slice(chunk_slice);
+
+                            for target in &target_addrs {
+                                let _ = socket.send_to(&pkt, target);
+                            }
+
+                            // Sunshine micro-pacing: pausa microscópica a cada 4 pacotes para evitar bufferbloat
+                            if (chunk_idx + 1) % 4 == 0 && (chunk_idx + 1) < total_chunks {
+                                std::thread::yield_now();
+                            }
+                        }
+
+                        // Emit FEC Parity packet for zero-latency recovery of Wi-Fi single-packet drops
+                        if let Some(parity) = fec_parity {
+                            let inst = get_process_instance_id();
+                            let mut fec_pkt = Vec::with_capacity(41 + parity.len());
+                            fec_pkt.extend_from_slice(MAGIC);
+                            fec_pkt.extend_from_slice(&inst.to_be_bytes());
+                            fec_pkt.push(OP_FEC_PARITY);
+                            fec_pkt.extend_from_slice(&cid.to_be_bytes());
+                            fec_pkt.extend_from_slice(&uid.to_be_bytes());
+                            fec_pkt.extend_from_slice(&frame_seq.to_be_bytes());
+                            fec_pkt.extend_from_slice(&pts_ms.to_be_bytes());
+                            fec_pkt.extend_from_slice(&total_chunks.to_be_bytes());
+                            fec_pkt.extend_from_slice(&(total_len as u32).to_be_bytes());
+                            fec_pkt.extend_from_slice(&parity);
+
+                            for target in &target_addrs {
+                                let _ = socket.send_to(&fec_pkt, target);
+                            }
+                        }
+                        let t_net_us = t_net_start.elapsed().as_micros();
+                        total_net_us += t_net_us;
+                    }
+
+                    tx_frame_count += 1;
+                    let turn_us = turn_start.elapsed().as_micros();
+                    turn_start = Instant::now();
+                    max_turn_us = max_turn_us.max(turn_us);
+                    if watched && turn_us > 100_000 {
+                        warn!("🐢 [TX] Volta do laço de envio levou {:.1} ms (codificação {:.1} ms)", turn_us as f64 / 1e3, enc_dur as f64 / 1e3);
+                    }
+                    if last_tx_stats.elapsed() >= Duration::from_secs(1) {
+                        let elapsed_s = last_tx_stats.elapsed().as_secs_f64();
+                        let fps = (tx_frame_count as f64) / elapsed_s;
+                        CURRENT_TX_FPS.store((fps * 10.0).round() as u32, Ordering::Relaxed);
+                        let n = tx_frame_count.max(1) as f64;
+                        let avg_enc_ms = (total_encode_us as f64) / n / 1000.0;
+                        let avg_preview_ms = (total_preview_us as f64) / n / 1000.0;
+                        let avg_crypt_ms = (total_crypt_us as f64) / n / 1000.0;
+                        let avg_fec_ms = (total_fec_us as f64) / n / 1000.0;
+                        let avg_net_ms = (total_net_us as f64) / n / 1000.0;
+                        let _avg_blt_ms = (total_blt_us as f64) / n / 1000.0;
+                        let _avg_pix_ms = (total_pix_us as f64) / n / 1000.0;
+                        let cur_mbps = (REQUESTED_BITRATE_BPS.load(Ordering::Relaxed) as f64) / 1_000_000.0;
+
+                        info!("📊 [DETALHAMENTO DE CPU & GPU (TX)] FPS: {:.1}/{} | Bitrate: {:.2} Mbps | Encode: {:.2}ms | UI Preview: {:.2}ms | Cripto E2EE: {:.2}ms | FEC: {:.2}ms | Rede UDP: {:.2}ms | Espera: {:.2}/{:.2}ms | Pior volta: {:.1}ms | Capturas novas: {}",
+                            fps, target_fps, cur_mbps, avg_enc_ms, avg_preview_ms, avg_crypt_ms, avg_fec_ms, avg_net_ms,
+                            total_park_us as f64 / n / 1000.0, total_park_asked_us as f64 / n / 1000.0, max_turn_us as f64 / 1000.0, new_captures);
+                        new_captures = 0;
+                        total_park_us = 0;
+                        total_park_asked_us = 0;
+                        max_turn_us = 0;
+
+                        tx_frame_count = 0;
+                        total_encode_us = 0;
+                        total_preview_us = 0;
+                        total_crypt_us = 0;
+                        total_fec_us = 0;
+                        total_net_us = 0;
+                        total_blt_us = 0;
+                        total_pix_us = 0;
+                        last_tx_stats = Instant::now();
+                    }
+                }
+
+                CURRENT_TX_FPS.store(0, Ordering::Relaxed);
+                stop_window_border_overlay();
+                info!("🖥️ Thread emissora de tela/vídeo finalizada.");
+            })
+            .expect("Failed to start TX thread");
+    }
+
+    /// Starts the background UDP receiver thread for incoming streams from peers
+    pub fn start_receiver<F, S>(&self, on_frame: F, on_state: S)
+    where
+        F: Fn(u64, String, String, SharedPixelBuffer<Rgba8Pixel>) + Send + Sync + 'static,
+        S: Fn(u64, bool) + Send + Sync + 'static,
+    {
+        if self.is_receiver_running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        let on_state_arc: Arc<dyn Fn(u64, bool) + Send + Sync + 'static> = Arc::new(on_state);
+        if let Ok(mut guard) = ON_STREAM_STATE_CB.lock() {
+            *guard = Some(Arc::clone(&on_state_arc));
+        }
+
+        start_global_signaling(
+            Arc::clone(&self.channel_id),
+            Arc::clone(&self.my_user_id),
+            Arc::clone(&self.my_username),
+            Arc::clone(&self.is_running),
+            Arc::clone(&self.known_peers),
+        );
+        let is_running = Arc::clone(&self.is_receiver_running);
+        let is_tx_running = Arc::clone(&self.is_running);
+        let channel_id_atomic = Arc::clone(&self.channel_id);
+        let my_user_id_atomic = Arc::clone(&self.my_user_id);
+        let my_username_arc = Arc::clone(&self.my_username);
+        let peers_store = Arc::clone(&self.known_peers);
+
+        struct QueuedVideoFrame {
+            peer_uid: u64,
+            peer_name: String,
+            peer_fps: u8,
+            seq: u32,
+            pts_ms: u32,
+            frame_data: Vec<u8>,
+        }
+
+        let (tx_decode, rx_decode) = std::sync::mpsc::sync_channel::<QueuedVideoFrame>(DECODE_QUEUE_FRAMES);
+
+        let is_running_decoder = Arc::clone(&self.is_receiver_running);
+        let channel_id_decoder = Arc::clone(&self.channel_id);
+        let my_user_id_decoder = Arc::clone(&self.my_user_id);
+        let peers_store_decoder = Arc::clone(&self.known_peers);
+
+        // Dedicated Video Decoder Worker Thread (Sunshine / Moonlight Architecture)
+        std::thread::Builder::new()
+            .name("video-decoder-worker".to_string())
+            .spawn(move || {
+                crate::cpu_profiler::set_current_thread_name("video-decoder-worker");
+                info!("🎬 [VIDEO DECODER WORKER] Dedicated H.264 decoding thread started with 120-frame elastic buffer!");
+                let mut decoders = StreamDecoders::default();
+                // Pictures the GPU draws straight into a window never reach the UI; it is
+                // told once a second (FPS, stream state) with the last known height.
+                let mut last_height: HashMap<u64, u32> = HashMap::new();
+                let mut last_gpu_ping: HashMap<u64, Instant> = HashMap::new();
+                let mut last_pli_req: HashMap<u64, Instant> = HashMap::new();
+                let mut rx_frame_count: HashMap<u64, u64> = HashMap::new();
+                let mut rx_last_stats: HashMap<u64, Instant> = HashMap::new();
+                let mut rx_error_streak: HashMap<u64, u32> = HashMap::new();
+                // Aguardando IDR por peer: quando true, dropa frames até receber SPS/IDR
+                let mut waiting_for_idr: HashMap<u64, bool> = HashMap::new();
+
+                while is_running_decoder.load(Ordering::Relaxed) {
+                    // The timeout only exists to zero the FPS readout after a stream
+                    // stalls; with no stream (FPS already 0) wait for the next frame.
+                    let next = if CURRENT_RX_FPS.load(Ordering::Relaxed) == 0 {
+                        rx_decode.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+                    } else {
+                        rx_decode.recv_timeout(Duration::from_millis(100))
+                    };
+                    match next {
+                        Ok(item) => {
+                            let QueuedVideoFrame { peer_uid, peer_name, peer_fps, seq, pts_ms, frame_data } = item;
+                            let t_dec_start = Instant::now();
+                            #[cfg(feature = "automation")]
+                            if let Some(delay) = crate::utils::test_hooks::decode_delay() {
+                                std::thread::sleep(delay);
+                            }
+                            #[cfg(feature = "automation")]
+                            if let Some(stall) = crate::utils::test_hooks::decode_stall_due() {
+                                std::thread::sleep(stall);
+                            }
+
+                            let mut send_pli = |target_uid: u64| {
+                                let should_req_pli = match last_pli_req.get(&target_uid) {
+                                    Some(&t) => t.elapsed() >= Duration::from_millis(1000),
+                                    None => true,
+                                };
+                                if should_req_pli {
+                                    last_pli_req.insert(target_uid, Instant::now());
+                                    let current_cid = channel_id_decoder.load(Ordering::Relaxed);
+                                    let my_uid = my_user_id_decoder.load(Ordering::Relaxed);
+                                    let inst = get_process_instance_id();
+                                    let mut req_pkt = Vec::with_capacity(33);
+                                    req_pkt.extend_from_slice(MAGIC);
+                                    req_pkt.extend_from_slice(&inst.to_be_bytes());
+                                    req_pkt.push(OP_KEYFRAME_REQ);
+                                    req_pkt.extend_from_slice(&current_cid.to_be_bytes());
+                                    req_pkt.extend_from_slice(&my_uid.to_be_bytes());
+                                    req_pkt.extend_from_slice(&target_uid.to_be_bytes());
+                                    if let Ok(guard) = SHARED_P2P_SOCKET.lock() {
+                                        if let Some(sock) = guard.as_ref() {
+                                            if let Ok(peers) = peers_store_decoder.lock() {
+                                                let mut sent_targets = Vec::new();
+                                                if let Ok(last_guard) = LAST_SEEN_PEER_ADDR.lock() {
+                                                    if let Some(map) = last_guard.as_ref() {
+                                                        if let Some(&direct_addr) = map.get(&target_uid) {
+                                                            if !is_tailscale_or_forbidden(&direct_addr) {
+                                                                let _ = sock.send_to(&req_pkt, direct_addr);
+                                                                sent_targets.push(direct_addr);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                for (&k, &(p_addr, _)) in peers.iter() {
+                                                    if is_tailscale_or_forbidden(&p_addr) {
+                                                        continue;
+                                                    }
+                                                    let base_low = (k & 0xFFFF_FFFF) as u32;
+                                                    let target_low = (target_uid & 0xFFFF_FFFF) as u32;
+                                                    let is_match = k == target_uid
+                                                        || base_low.abs_diff(target_low) < 16;
+                                                    if is_match && !sent_targets.contains(&p_addr) {
+                                                        let _ = sock.send_to(&req_pkt, p_addr);
+                                                        sent_targets.push(p_addr);
+                                                    }
+                                                }
+                                                info!("🔄 [PLI RECOVERY] Keyframe solicitado ao peer {} (rotas acionadas: {:?})", target_uid, sent_targets);
+                                            }
+                                            for bcast in get_broadcast_addresses() {
+                                                let _ = sock.send_to(&req_pkt, bcast);
+                                            }
+                                        }
+                                    }
+                                }
+                            };
+
+                            // No window can show the stream: skip the decode. The picture shown
+                            // when a window comes back starts from a keyframe, asked for below.
+                            if !streams_watched() {
+                                RX_FRAMES_UNWATCHED.fetch_add(1, Ordering::Relaxed);
+                                waiting_for_idr.insert(peer_uid, true);
+                                // Also free the GPU decoder (device and surfaces) meanwhile.
+                                decoders.release_gpu();
+                                continue;
+                            }
+
+                            // Frames of this peer were dropped at the full queue: the ones after them
+                            // cannot be decoded cleanly, so wait for a keyframe (and ask for it).
+                            if take_decode_resync(peer_uid) {
+                                waiting_for_idr.insert(peer_uid, true);
+                            }
+
+                            // Se estiver aguardando IDR, verificar se o frame atual contém SPS ou IDR antes de decodificar
+                            if *waiting_for_idr.entry(peer_uid).or_insert(false) {
+                                let is_idr_or_sps = frame_data.windows(5).any(|w| {
+                                    (w[..4] == [0, 0, 0, 1] && (w[4] & 0x1F == 7 || w[4] & 0x1F == 5)) ||
+                                    (w[..3] == [0, 0, 1] && (w[3] & 0x1F == 7 || w[3] & 0x1F == 5))
+                                });
+                                if !is_idr_or_sps {
+                                    // Continua aguardando IDR: solicita PLI periodicamente para destravar o transmissor
+                                    send_pli(peer_uid);
+                                    continue;
+                                }
+                                // Recebeu IDR/SPS — pode decodificar normalmente
+                                waiting_for_idr.insert(peer_uid, false);
+                                log::info!("✅ [DECODER RECOVERY] IDR/SPS recebido para peer {} — retomando decodificação!", peer_uid);
+                            }
+
+                            let decoded = decode_video_frame(&mut decoders, peer_uid, &frame_data);
+                            let shown = match decoded {
+                                Decoded::Picture(ref buf, _w, h) => {
+                                    last_height.insert(peer_uid, h);
+                                    Some(Some(buf.clone()))
+                                }
+                                Decoded::ShownByGpu(h) => {
+                                    last_height.insert(peer_uid, h);
+                                    Some(None)
+                                }
+                                _ => None,
+                            };
+                            if let Some(picture) = shown {
+                                let h = last_height.get(&peer_uid).copied().unwrap_or(0);
+                                let dec_us = t_dec_start.elapsed().as_micros();
+                                let count = rx_frame_count.entry(peer_uid).or_insert(0);
+                                *count += 1;
+                                let last_stats = rx_last_stats.entry(peer_uid).or_insert_with(Instant::now);
+                                if last_stats.elapsed() >= Duration::from_secs(1) {
+                                    let elapsed_s = last_stats.elapsed().as_secs_f64();
+                                    let rx_fps = (*count as f64) / elapsed_s;
+                                    CURRENT_RX_FPS.store((rx_fps * 10.0).round() as u32, Ordering::Relaxed);
+                                    info!("📥 [TELEMETRIA RX WORKER] Peer {}: {:.1} FPS ({} quadros em {:.2}s) | {}p {}fps | Decode: {:.2}ms",
+                                        peer_uid, rx_fps, *count, elapsed_s, h, peer_fps, dec_us as f64 / 1000.0);
+                                    *count = 0;
+                                    *last_stats = Instant::now();
+                                }
+
+                                // A frame decoded after the stream was stopped is a leftover.
+                                if is_stream_recently_stopped(peer_uid) {
+                                    continue;
+                                }
+                                let pixel_buffer = match picture {
+                                    Some(buf) => buf,
+                                    None => {
+                                        RX_FRAMES_SHOWN.fetch_add(1, Ordering::Relaxed);
+                                        rx_error_streak.remove(&peer_uid);
+                                        let due = last_gpu_ping.get(&peer_uid).map(|t| t.elapsed() >= Duration::from_secs(1)).unwrap_or(true);
+                                        if !due {
+                                            continue;
+                                        }
+                                        last_gpu_ping.insert(peer_uid, Instant::now());
+                                        SharedPixelBuffer::<Rgba8Pixel>::new(1, 1)
+                                    }
+                                };
+                                if let Ok(mut f_map) = get_active_stream_frames().lock() {
+                                    f_map.insert(peer_uid, pixel_buffer.clone());
+                                }
+                                let quality_label = format!("{}p {}fps (H.264)", h, peer_fps);
+
+                                // Non-blocking Fine Audio-Video Lip Sync Telemetry
+                                let audio_pts = get_estimated_audio_pts();
+                                if audio_pts > 0 && pts_ms > 0 {
+                                    let delta = (pts_ms as i64) - (audio_pts as i64);
+                                    log::trace!("⏱️ [A/V SYNC] Frame {} | Video PTS: {}ms | Audio PTS: {}ms | Delta: {}ms", seq, pts_ms, audio_pts, delta);
+                                }
+
+                                if pixel_buffer.width() > 1 {
+                                    rx_error_streak.remove(&peer_uid);
+                                    RX_FRAMES_SHOWN.fetch_add(1, Ordering::Relaxed);
+                                }
+                                on_frame(peer_uid, peer_name, quality_label, pixel_buffer);
+                            } else if let Decoded::NeedKeyframe = decoded {
+                                waiting_for_idr.insert(peer_uid, true);
+                                send_pli(peer_uid);
+                            } else if let Decoded::Failed = decoded {
+                                let streak = rx_error_streak.entry(peer_uid).or_insert(0);
+                                *streak += 1;
+                                if *streak >= 60 {
+                                    log::info!("🔄 [DECODER RECOVERY] Resetando o decodificador do peer {} após {} falhas consecutivas — aguardando IDR", peer_uid, *streak);
+                                    decoders.reset(peer_uid);
+                                    waiting_for_idr.insert(peer_uid, true);
+                                    *streak = 0;
+                                }
+
+                                send_pli(peer_uid);
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            let mut has_recent = false;
+                            for (_, t) in rx_last_stats.iter() {
+                                if t.elapsed() < Duration::from_millis(2000) {
+                                    has_recent = true;
+                                    break;
+                                }
+                            }
+                            if !has_recent && CURRENT_RX_FPS.load(Ordering::Relaxed) > 0 {
+                                CURRENT_RX_FPS.store(0, Ordering::Relaxed);
+                                // No stream arriving: let the GPU decoder go until the next one.
+                                decoders.release_gpu();
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                CURRENT_RX_FPS.store(0, Ordering::Relaxed);
+                info!("🎬 [VIDEO DECODER WORKER] Thread de decodificação finalizada.");
+            })
+            .ok();
+
+        std::thread::Builder::new()
+            .name("screen-capture-rx".to_string())
+            .spawn(move || {
+                crate::cpu_profiler::set_current_thread_name("screen-capture-rx");
+                let (socket, bound_port) = {
+                    let mut bound = None;
+                    for port in P2P_VIDEO_PORT..=(P2P_VIDEO_PORT + 10) {
+                        if let Ok(addr) = format!("0.0.0.0:{}", port).parse::<SocketAddr>() {
+                            if let Ok(sock) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, Some(socket2::Protocol::UDP)) {
+                                let _ = sock.set_send_buffer_size(16 * 1024 * 1024);
+                                let _ = sock.set_recv_buffer_size(16 * 1024 * 1024);
+                                let _ = sock.set_broadcast(true);
+                                let _ = sock.set_read_timeout(Some(Duration::from_millis(2)));
+                                if sock.bind(&addr.into()).is_ok() {
+                                    let std_sock: UdpSocket = sock.into();
+                                    bound = Some((std_sock, port));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    match bound {
+                        Some(pair) => pair,
+                        None => {
+                            if let Ok(addr) = "0.0.0.0:0".parse::<SocketAddr>() {
+                                if let Ok(sock) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, Some(socket2::Protocol::UDP)) {
+                                    let _ = sock.set_send_buffer_size(16 * 1024 * 1024);
+                                    let _ = sock.set_recv_buffer_size(16 * 1024 * 1024);
+                                    let _ = sock.set_broadcast(true);
+                                    let _ = sock.set_read_timeout(Some(Duration::from_millis(2)));
+                                    if sock.bind(&addr.into()).is_ok() {
+                                        let std_sock: UdpSocket = sock.into();
+                                        let p = std_sock.local_addr().map(|a| a.port()).unwrap_or(P2P_VIDEO_PORT);
+                                        (std_sock, p)
+                                    } else {
+                                        warn!("Failed to bind RX UDP socket");
+                                        return;
+                                    }
+                                } else {
+                                    warn!("Failed to create RX UDP socket");
+                                    return;
+                                }
+                            } else {
+                                warn!("Failed to parse RX UDP address");
+                                return;
+                            }
+                        }
+                    }
+                };
+
+                set_my_rx_port(bound_port);
+                let socket = Arc::new(socket);
+                if let Ok(mut lock) = SHARED_P2P_SOCKET.lock() {
+                    *lock = Some(Arc::clone(&socket));
+                }
+                let mut recv_buf = vec![0u8; 65535];
+                struct InFlightFrame {
+                    total_chunks: u16,
+                    total_len: usize,
+                    pts_ms: u32,
+                    received: HashMap<u16, Vec<u8>>,
+                    parity: Option<Vec<u8>>,
+                    first_seen: Instant,
+                }
+                let mut in_flight: HashMap<u64, HashMap<u32, InFlightFrame>> = HashMap::new();
+                let mut last_rendered_seq: HashMap<u64, u32> = HashMap::new();
+                let mut peer_names: HashMap<u64, String> = HashMap::new();
+                let mut peer_fps: HashMap<u64, u8> = HashMap::new();
+                #[derive(Default, Debug)]
+                struct PeerQosWindow {
+                    frames_received: u32,
+                    frames_lost: u32,
+                    fec_recovered: u32,
+                }
+                let mut qos_windows: HashMap<u64, PeerQosWindow> = HashMap::new();
+
+                // Log throttling: these used to be written once per packet / per tick.
+                let mut rx_pkts_since_log: u64 = 0;
+                let mut rx_last_log = Instant::now();
+                let mut hb_last_summary = String::new();
+                let mut hb_last_log = Instant::now();
+                let mut stun_last_logged: Option<SocketAddr> = None;
+                let mut queue_full_dropped: u32 = 0;
+                let mut queue_full_last = Instant::now() - Duration::from_secs(10);
+                let mut keyframe_last_honored = Instant::now() - Duration::from_secs(10);
+                let mut active_streaming_users: HashMap<u64, bool> = HashMap::new();
+                let mut last_stream_activity: HashMap<u64, Instant> = HashMap::new();
+                let mut last_qos_feedback_time = Instant::now();
+                let mut last_watch_request = Instant::now() - Duration::from_secs(10);
+                // Opus decoders of the streams being watched, by peer.
+                let mut audio_decoders: HashMap<u64, super::stream_audio::StreamAudioDecoder> = HashMap::new();
+                let mut requested: Vec<u64> = Vec::new();
+
+                let my_instance_id = get_process_instance_id();
+                let mut last_outbound_heartbeat = Instant::now() - Duration::from_secs(10);
+
+                // Idle backoff: after ~1 s without traffic block in recv instead of waking
+                // every ~6 ms (see `idle_timeout` below). Incoming data still wakes the
+                // thread immediately, so latency is unchanged.
+                let mut idle_iterations: u32 = 0;
+                let mut idle_timeout: Option<Option<Duration>> = None;
+                while is_running.load(Ordering::Relaxed) {
+                    let in_call = crate::gateway::is_connected_to_voice() || is_tx_running.load(Ordering::Relaxed);
+                    let mut current_cid = channel_id_atomic.load(Ordering::Relaxed);
+                    if current_cid == 0 {
+                        current_cid = current_voice_channel_fallback();
+                        if current_cid > 0 {
+                            channel_id_atomic.store(current_cid, Ordering::Relaxed);
+                        }
+                    }
+                    let mut my_uid = my_user_id_atomic.load(Ordering::Relaxed);
+                    if my_uid == 0 {
+                        my_uid = crate::gateway::get_my_user_id();
+                        if my_uid > 0 {
+                            my_user_id_atomic.store(my_uid, Ordering::Relaxed);
+                        }
+                    }
+
+                    // Periodic Sunshine-grade RTCP QoS / Bitrate Feedback to active senders every 1.0s
+                    if last_qos_feedback_time.elapsed() >= Duration::from_millis(1000) {
+                        last_qos_feedback_time = Instant::now();
+                        for (&peer_uid, qos) in qos_windows.iter_mut() {
+                            let total = qos.frames_received + qos.frames_lost;
+                            if total > 0 {
+                                let loss_permille = ((qos.frames_lost as u64 * 1000) / (total as u64)) as u16;
+
+                                let inst = get_process_instance_id();
+                                let mut qos_pkt = Vec::with_capacity(31);
+                                qos_pkt.extend_from_slice(MAGIC);
+                                qos_pkt.extend_from_slice(&inst.to_be_bytes());
+                                qos_pkt.push(OP_QOS_FEEDBACK);
+                                qos_pkt.extend_from_slice(&current_cid.to_be_bytes());
+                                qos_pkt.extend_from_slice(&my_uid.to_be_bytes());
+                                qos_pkt.extend_from_slice(&peer_uid.to_be_bytes());
+                                qos_pkt.extend_from_slice(&loss_permille.to_be_bytes());
+
+                                // To where the stream comes from (presence entries are not keyed by uid alone).
+                                if let Some(&p_addr) = peer_addrs(peer_uid, &peers_store).first() {
+                                    let _ = socket.send_to(&qos_pkt, p_addr);
+                                }
+
+                                if qos.fec_recovered > 0 || qos.frames_lost > 0 {
+                                    info!("🛡️ [QOS TELEMETRIA RX] Peer {}: {} frames OK, {} recuperados via FEC, {} perdidos (Perda real: {:.1}%)",
+                                        peer_uid, qos.frames_received, qos.fec_recovered, qos.frames_lost, (loss_permille as f64) / 10.0
+                                    );
+                                }
+                            }
+                            qos.frames_received = 0;
+                            qos.frames_lost = 0;
+                            qos.fec_recovered = 0;
+                        }
+                    }
+
+                    // Watch requests: renewed every second for the streams the user wants and
+                    // a window can show; the others get an UNWATCH right away.
+                    let wanted: Vec<u64> = if in_call && current_cid > 0 && my_uid > 0 { super::watch::streams_to_request() } else { Vec::new() };
+                    if (wanted != requested || last_watch_request.elapsed() >= super::watch::RENEW_EVERY) && (!wanted.is_empty() || !requested.is_empty()) {
+                        last_watch_request = Instant::now();
+                        let my_public = get_or_create_local_ecdh_keypair();
+                        for &peer in &wanted {
+                            let mut pkt = Vec::with_capacity(65);
+                            pkt.extend_from_slice(MAGIC);
+                            pkt.extend_from_slice(&my_instance_id.to_be_bytes());
+                            pkt.push(OP_WATCH);
+                            pkt.extend_from_slice(&current_cid.to_be_bytes());
+                            pkt.extend_from_slice(&my_uid.to_be_bytes());
+                            pkt.extend_from_slice(&peer.to_be_bytes());
+                            pkt.extend_from_slice(&my_public);
+                            for addr in peer_addrs(peer, &peers_store) {
+                                let _ = socket.send_to(&pkt, addr);
+                            }
+                        }
+                        for &peer in requested.iter().filter(|p| !wanted.contains(p)) {
+                            let mut pkt = Vec::with_capacity(33);
+                            pkt.extend_from_slice(MAGIC);
+                            pkt.extend_from_slice(&my_instance_id.to_be_bytes());
+                            pkt.push(OP_UNWATCH);
+                            pkt.extend_from_slice(&current_cid.to_be_bytes());
+                            pkt.extend_from_slice(&my_uid.to_be_bytes());
+                            pkt.extend_from_slice(&peer.to_be_bytes());
+                            for addr in peer_addrs(peer, &peers_store) {
+                                for _ in 0..3 {
+                                    let _ = socket.send_to(&pkt, addr);
+                                }
+                            }
+                        }
+                        requested = wanted;
+                    }
+
+                    // Heartbeats keep NAT routes open only where a stream flows (the watch
+                    // requests above already do it for viewers), or find peers on the local
+                    // network while the signaling server is unreachable.
+                    let needs_heartbeat = is_tx_running.load(Ordering::Relaxed) || !requested.is_empty() || !signaling_connected();
+                    // Proactive presence heartbeat every 1.5s to maintain direct peer routes and NAT pinholes
+                    let heartbeat_every = if peers_store.lock().map(|p| p.is_empty()).unwrap_or(false) {
+                        Duration::from_millis(4000)
+                    } else {
+                        Duration::from_millis(1500)
+                    };
+                    if in_call && needs_heartbeat && last_outbound_heartbeat.elapsed() >= heartbeat_every {
+                        last_outbound_heartbeat = Instant::now();
+                        let mut uname = my_username_arc.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        if uname.is_empty() {
+                            uname = crate::gateway::get_my_username();
+                            if !uname.is_empty() {
+                                *my_username_arc.lock().unwrap_or_else(|e| e.into_inner()) = uname.clone();
+                            }
+                        }
+                        let uname_bytes = uname.as_bytes();
+                        let my_rx = get_my_rx_port();
+                        let mut hb_pkt = Vec::with_capacity(30 + uname_bytes.len());
+                        hb_pkt.extend_from_slice(MAGIC);
+                        hb_pkt.extend_from_slice(&my_instance_id.to_be_bytes());
+                        hb_pkt.push(OP_HEARTBEAT);
+                        hb_pkt.extend_from_slice(&current_cid.to_be_bytes());
+                        hb_pkt.extend_from_slice(&my_uid.to_be_bytes());
+                        hb_pkt.push(0);
+                        hb_pkt.push(2);
+                        hb_pkt.push(uname_bytes.len() as u8);
+                        hb_pkt.extend_from_slice(uname_bytes);
+                        hb_pkt.extend_from_slice(&my_rx.to_be_bytes());
+
+                        // Local-network broadcast only while the signaling server is out of reach.
+                        let bcasts = if signaling_connected() { Vec::new() } else { get_broadcast_addresses() };
+                        for target in &bcasts {
+                            let _ = socket.send_to(&hb_pkt, target);
+                        }
+                        
+                        let mut sent_peers = Vec::new();
+                        if let Ok(peers) = peers_store.lock() {
+                            for (&_p_uid, &(p_addr, _)) in peers.iter() {
+                                if !is_tailscale_or_forbidden(&p_addr) {
+                                    let _ = socket.send_to(&hb_pkt, p_addr);
+                                    sent_peers.push(p_addr);
+                                }
+                            }
+                        }
+                        // Enviar também para LAST_SEEN_PEER_ADDR para manter NAT pinhole aberto
+                        let mut sent_last = Vec::new();
+                        if let Ok(last_guard) = LAST_SEEN_PEER_ADDR.lock() {
+                            if let Some(map) = last_guard.as_ref() {
+                                for (&_p_uid, &addr) in map.iter() {
+                                    if !is_tailscale_or_forbidden(&addr) {
+                                        let _ = socket.send_to(&hb_pkt, addr);
+                                        sent_last.push(addr);
+                                    }
+                                }
+                            }
+                        }
+                        let summary = format!("{} bcasts. PeersStore: {:?}, LastSeen: {:?}", bcasts.len(), sent_peers, sent_last);
+                        if summary != hb_last_summary || hb_last_log.elapsed() >= Duration::from_secs(60) {
+                            info!("💓 [HEARTBEAT PROATIVO] Enviado para {}", summary);
+                            hb_last_summary = summary;
+                            hb_last_log = Instant::now();
+                        }
+                    }
+
+                    let mut packets_drained = 0;
+                    for _ in 0..128 {
+                        match socket.recv_from(&mut recv_buf) {
+                            Ok((len, src_addr)) => {
+                                packets_drained += 1;
+                                // Woken from a long wait: drain the rest with the short timeout,
+                                // or this loop keeps blocking for up to 128 packets.
+                                if idle_timeout.is_some() {
+                                    let _ = socket.set_read_timeout(Some(Duration::from_millis(2)));
+                                    idle_timeout = None;
+                                }
+                                // 1. STUN Binding Success Response (0x01, 0x01 with Magic Cookie 0x2112A442)
+                                if len >= 20 && recv_buf[0] == 0x01 && recv_buf[1] == 0x01 && &recv_buf[4..8] == &[0x21, 0x12, 0xa4, 0x42] {
+                                    let mut i = 20;
+                                    while i + 4 <= len {
+                                        let attr_type = u16::from_be_bytes([recv_buf[i], recv_buf[i + 1]]);
+                                        let attr_len = u16::from_be_bytes([recv_buf[i + 2], recv_buf[i + 3]]) as usize;
+                                        if i + 4 + attr_len > len { break; }
+                                        if (attr_type == 0x0020 || attr_type == 0x0001) && attr_len >= 8 && recv_buf[i + 5] == 0x01 {
+                                            let port = if attr_type == 0x0020 {
+                                                u16::from_be_bytes([recv_buf[i + 6], recv_buf[i + 7]]) ^ 0x2112
+                                            } else {
+                                                u16::from_be_bytes([recv_buf[i + 6], recv_buf[i + 7]])
+                                            };
+                                            let ip = if attr_type == 0x0020 {
+                                                std::net::Ipv4Addr::new(
+                                                    recv_buf[i + 8] ^ 0x21,
+                                                    recv_buf[i + 9] ^ 0x12,
+                                                    recv_buf[i + 10] ^ 0xa4,
+                                                    recv_buf[i + 11] ^ 0x42,
+                                                )
+                                            } else {
+                                                std::net::Ipv4Addr::new(recv_buf[i + 8], recv_buf[i + 9], recv_buf[i + 10], recv_buf[i + 11])
+                                            };
+                                            let public_stun_addr = SocketAddr::new(std::net::IpAddr::V4(ip), port);
+                                            if let Ok(mut guard) = CACHED_STUN_ADDR.lock() {
+                                                *guard = Some((public_stun_addr, Instant::now()));
+                                            }
+                                            if stun_last_logged != Some(public_stun_addr) {
+                                                stun_last_logged = Some(public_stun_addr);
+                                                info!("🌐 [NAT TRAVERSAL] Porta pública mapeada com sucesso no socket P2P: {}", public_stun_addr);
+                                            }
+                                            break;
+                                        }
+                                        i += 4 + ((attr_len + 3) & !3);
+                                    }
+                                    continue;
+                                }
+
+                                if len < 25 || &recv_buf[0..4] != MAGIC {
+                                    continue;
+                                }
+                                let pkt_inst = u32::from_be_bytes(recv_buf[4..8].try_into().unwrap());
+                                if pkt_inst == my_instance_id {
+                                    continue;
+                                }
+
+                                let op = recv_buf[8];
+                                let pkt_cid = u64::from_be_bytes(recv_buf[9..17].try_into().unwrap());
+                                let pkt_uid = u64::from_be_bytes(recv_buf[17..25].try_into().unwrap());
+
+                                if (pkt_uid == my_uid && my_uid > 0) || pkt_inst == my_instance_id {
+                                    continue;
+                                }
+
+                                rx_pkts_since_log += 1;
+                                if rx_last_log.elapsed() >= Duration::from_secs(10) {
+                                    info!("📥 [TELEMETRIA RX P2P] {} pacotes nos últimos {:.0}s (último: OP={}, UID={}, IP={})",
+                                        rx_pkts_since_log, rx_last_log.elapsed().as_secs_f32(), op, pkt_uid, src_addr);
+                                    rx_pkts_since_log = 0;
+                                    rx_last_log = Instant::now();
+                                }
+
+                                let my_current_cid = current_voice_channel_fallback();
+                                // Regra Estrita de Segurança & Privacidade:
+                                // Descarta imediatamente qualquer pacote de áudio/vídeo se não estivermos na mesma sala de voz
+                                if my_current_cid == 0 || pkt_cid == 0 || pkt_cid != my_current_cid {
+                                    continue;
+                                }
+
+                                if !is_tailscale_or_forbidden(&src_addr) {
+                                    if let Ok(mut last_guard) = LAST_SEEN_PEER_ADDR.lock() {
+                                        last_guard.get_or_insert_with(HashMap::new).insert(pkt_uid, src_addr);
+                                    }
+                                }
+
+                            match op {
+                                OP_ANNOUNCE => {
+                                    if len >= 29 {
+                                        let is_streaming = recv_buf[25] == 1;
+                                        let fps_val = recv_buf[27];
+                                        if fps_val > 0 {
+                                            peer_fps.insert(pkt_uid, fps_val);
+                                        }
+                                        let name_len = recv_buf[28] as usize;
+                                        if len >= 29 + name_len {
+                                            if let Ok(uname) = std::str::from_utf8(&recv_buf[29..29 + name_len]) {
+                                                peer_names.insert(pkt_uid, uname.to_string());
+                                            }
+                                        }
+
+                                        let is_private_ip = match src_addr.ip() {
+                                            std::net::IpAddr::V4(ipv4) => ipv4.is_private() || ipv4.is_loopback(),
+                                            std::net::IpAddr::V6(ipv6) => ipv6.is_loopback(),
+                                        };
+
+                                        let peer_rx_port = if is_private_ip && len >= 29 + name_len + 2 {
+                                            u16::from_be_bytes(recv_buf[29 + name_len..31 + name_len].try_into().unwrap())
+                                        } else {
+                                            src_addr.port()
+                                        };
+
+                                        let explicit_addr = SocketAddr::new(src_addr.ip(), peer_rx_port);
+
+                                        if !is_tailscale_or_forbidden(&src_addr) {
+                                            if let Ok(mut peers) = peers_store.lock() {
+                                                peers.insert(pkt_uid, (src_addr, Instant::now()));
+                                                if is_private_ip && explicit_addr != src_addr && !is_tailscale_or_forbidden(&explicit_addr) {
+                                                    peers.insert(pkt_uid.wrapping_add(0x8000_0000_0000_0000), (explicit_addr, Instant::now()));
+                                                }
+                                            }
+                                        }
+
+                                        // Instant reciprocal heartbeat so transmitter gets our direct IP and RX port
+                                        if is_streaming {
+                                            let uname = my_username_arc.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                                            let uname_bytes = uname.as_bytes();
+                                            let my_rx = get_my_rx_port();
+                                            let mut ack_pkt = Vec::with_capacity(30 + uname_bytes.len());
+                                            ack_pkt.extend_from_slice(MAGIC);
+                                            ack_pkt.extend_from_slice(&my_instance_id.to_be_bytes());
+                                            ack_pkt.push(OP_HEARTBEAT);
+                                            ack_pkt.extend_from_slice(&current_cid.to_be_bytes());
+                                            ack_pkt.extend_from_slice(&my_uid.to_be_bytes());
+                                            ack_pkt.push(0);
+                                            ack_pkt.push(2);
+                                            ack_pkt.push(uname_bytes.len() as u8);
+                                            ack_pkt.extend_from_slice(uname_bytes);
+                                            ack_pkt.extend_from_slice(&my_rx.to_be_bytes());
+
+                                            let _ = socket.send_to(&ack_pkt, src_addr);
+                                            if explicit_addr != src_addr {
+                                                let _ = socket.send_to(&ack_pkt, explicit_addr);
+                                            }
+                                        }
+
+                                        if pkt_inst == my_instance_id {
+                                            continue;
+                                        }
+                                        if is_streaming {
+                                            mark_stream_started(pkt_uid);
+                                            last_stream_activity.insert(pkt_uid, Instant::now());
+                                        }
+                                        let prev_state = active_streaming_users.insert(pkt_uid, is_streaming);
+                                        if prev_state != Some(is_streaming) {
+                                            if is_streaming {
+                                                PEER_STREAMING_STATES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(pkt_uid, true);
+                                            }
+                                            info!("📡 Usuário {} alterou estado de stream: {}", pkt_uid, is_streaming);
+                                            // Senders announce only while streaming: an announce saying
+                                            // otherwise is forged, and does not end anybody's stream.
+                                            if is_streaming {
+                                                on_state_arc(pkt_uid, true);
+                                            }
+                                        }
+                                    }
+                                }
+                                OP_HEARTBEAT => {
+                                    if len >= 28 {
+                                        let name_len = recv_buf[27] as usize;
+                                        if len >= 28 + name_len {
+                                            if let Ok(uname) = std::str::from_utf8(&recv_buf[28..28 + name_len]) {
+                                                peer_names.insert(pkt_uid, uname.to_string());
+                                            }
+                                        }
+
+                                        let is_private_ip = match src_addr.ip() {
+                                            std::net::IpAddr::V4(ipv4) => ipv4.is_private() || ipv4.is_loopback(),
+                                            std::net::IpAddr::V6(ipv6) => ipv6.is_loopback(),
+                                        };
+
+                                        let peer_port = if is_private_ip && len >= 28 + name_len + 2 {
+                                            u16::from_be_bytes(recv_buf[28 + name_len..30 + name_len].try_into().unwrap())
+                                        } else {
+                                            src_addr.port()
+                                        };
+
+                                        let explicit_addr = SocketAddr::new(src_addr.ip(), peer_port);
+                                        if !is_tailscale_or_forbidden(&src_addr) {
+                                            let peer_key = (pkt_uid as u64) ^ ((pkt_inst as u64) << 32);
+                                            if let Ok(mut peers) = peers_store.lock() {
+                                                let is_new = !peers.contains_key(&peer_key);
+                                                peers.insert(peer_key, (src_addr, Instant::now()));
+                                                if is_private_ip && explicit_addr != src_addr && !is_tailscale_or_forbidden(&explicit_addr) {
+                                                    peers.insert(peer_key.wrapping_add(0x8000_0000_0000_0000), (explicit_addr, Instant::now()));
+                                                }
+                                                if is_new {
+                                                    info!("📡 [P2P HEARTBEAT RECEBIDO] Novo peer UID={} conectado em {}", pkt_uid, src_addr);
+                                                    if is_tx_running.load(Ordering::Relaxed) {
+                                                        KEYFRAME_REQUESTED.store(true, Ordering::Relaxed);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                OP_VIDEO_CHUNK => {
+                                    if current_cid == 0 {
+                                        current_cid = crate::gateway::get_my_voice_channel_id();
+                                    }
+                                    if current_cid != 0 && pkt_cid != 0 && pkt_cid != current_cid {
+                                        continue;
+                                    }
+                                    if pkt_inst == my_instance_id {
+                                        continue;
+                                    }
+                                    // Leftovers of a stream that was just stopped must not re-open it.
+                                    if is_stream_recently_stopped(pkt_uid) {
+                                        continue;
+                                    }
+                                    last_stream_activity.insert(pkt_uid, Instant::now());
+                                    if len >= 37 {
+                                        let seq = u32::from_be_bytes(recv_buf[25..29].try_into().unwrap());
+                                        let pts_ms = u32::from_be_bytes(recv_buf[29..33].try_into().unwrap());
+                                        let total = u16::from_be_bytes(recv_buf[33..35].try_into().unwrap());
+                                        let idx = u16::from_be_bytes(recv_buf[35..37].try_into().unwrap());
+                                        let chunk_data = recv_buf[37..len].to_vec();
+
+                                        let user_frames = in_flight.entry(pkt_uid).or_insert_with(HashMap::new);
+                                        if user_frames.len() > 30 {
+                                            let now = Instant::now();
+                                            user_frames.retain(|_, f| now.duration_since(f.first_seen) < Duration::from_millis(500));
+                                        }
+                                        let frame_entry = user_frames.entry(seq).or_insert_with(|| InFlightFrame {
+                                            total_chunks: total,
+                                            total_len: 0,
+                                            pts_ms,
+                                            received: HashMap::with_capacity(total as usize),
+                                            parity: None,
+                                            first_seen: Instant::now(),
+                                        });
+                                        frame_entry.pts_ms = pts_ms;
+                                        frame_entry.total_chunks = total;
+                                        frame_entry.received.insert(idx, chunk_data);
+
+                                        // Bidirectional FEC Parity Recovery (If parity packet arrived before this chunk)
+                                        if frame_entry.received.len() == (total as usize).saturating_sub(1) && frame_entry.parity.is_some() {
+                                            let mut missing_idx = None;
+                                            for i in 0..total {
+                                                if !frame_entry.received.contains_key(&i) { missing_idx = Some(i); break; }
+                                            }
+                                            if let Some(m_idx) = missing_idx {
+                                                if let Some(parity) = frame_entry.parity.as_ref() {
+                                                    let mut recovered = parity.clone();
+                                                    for (&_c_i, chunk) in &frame_entry.received {
+                                                        for (i, &b) in chunk.iter().enumerate() {
+                                                            if i < recovered.len() { recovered[i] ^= b; }
+                                                        }
+                                                    }
+                                                    if m_idx == total.saturating_sub(1) && frame_entry.total_len > 0 {
+                                                        let expected_last_len = frame_entry.total_len.saturating_sub((total as usize - 1) * CHUNK_SIZE);
+                                                        if expected_last_len > 0 && expected_last_len < recovered.len() {
+                                                            recovered.truncate(expected_last_len);
+                                                        }
+                                                    }
+                                                    frame_entry.received.insert(m_idx, recovered);
+                                                }
+                                            }
+                                        }
+
+                                        if frame_entry.received.len() == (total as usize) {
+                                            let mut complete_frame = Vec::new();
+                                            for i in 0..total {
+                                                if let Some(c) = frame_entry.received.get(&i) {
+                                                    complete_frame.extend_from_slice(c);
+                                                }
+                                            }
+                                            if frame_entry.total_len > 0 && complete_frame.len() > frame_entry.total_len {
+                                                complete_frame.truncate(frame_entry.total_len);
+                                            }
+                                            user_frames.remove(&seq);
+
+                                            // Only what opens with the key this sender handed us counts: no
+                                            // plaintext, and nothing from streams we did not ask for.
+                                            let final_frame_opt = super::watch::stream_key(pkt_uid)
+                                                .and_then(|k| decrypt_signaling_payload(&k, &complete_frame));
+                                            if final_frame_opt.is_some() {
+                                                super::watch::video_arrived(pkt_uid);
+                                            }
+
+                                            if let Some(valid_frame) = final_frame_opt {
+                                                let last_seq = last_rendered_seq.get(&pkt_uid).copied().unwrap_or(0);
+                                                let is_newer = seq > last_seq || (last_seq.wrapping_sub(seq) > 0x8000_0000);
+
+                                                if is_newer || last_rendered_seq.get(&pkt_uid).is_none() {
+                                                    last_rendered_seq.insert(pkt_uid, seq);
+
+                                                    let prev_state = active_streaming_users.insert(pkt_uid, true);
+                                                    if prev_state != Some(true) {
+                                                        info!("📡 [AUTO-ATIVAÇÃO STREAM] Usuário {} iniciou transmissão de tela (quadro recebido)!", pkt_uid);
+                                                        on_state_arc(pkt_uid, true);
+                                                    }
+
+                                                    let qos = qos_windows.entry(pkt_uid).or_default();
+                                                    qos.frames_received += 1;
+                                                    last_stream_activity.insert(pkt_uid, Instant::now());
+
+                                                    let uname = peer_names.get(&pkt_uid).cloned().unwrap_or_else(|| format!("Usuário {}", pkt_uid));
+                                                    let fps_val = peer_fps.get(&pkt_uid).copied().unwrap_or(60);
+
+                                                    let q_item = QueuedVideoFrame {
+                                                        peer_uid: pkt_uid,
+                                                        peer_name: uname,
+                                                        peer_fps: fps_val,
+                                                        seq,
+                                                        pts_ms,
+                                                        frame_data: valid_frame,
+                                                    };
+
+                                                    if let Err(std::sync::mpsc::TrySendError::Full(_)) = tx_decode.try_send(q_item) {
+                                                        queue_full_dropped += 1;
+                                                        mark_decode_resync(pkt_uid);
+                                                        if queue_full_last.elapsed() >= Duration::from_secs(1) {
+                                                            log::warn!("⚠️ [JITTER BUFFER] Fila de decodificação cheia ({} quadros): {} quadro(s) descartado(s); pedindo Keyframe ao transmissor {}", DECODE_QUEUE_FRAMES, queue_full_dropped, pkt_uid);
+                                                            queue_full_dropped = 0;
+                                                            queue_full_last = Instant::now();
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                OP_FEC_PARITY => {
+                                    if current_cid == 0 {
+                                        current_cid = crate::gateway::get_my_voice_channel_id();
+                                    }
+                                    if current_cid != 0 && pkt_cid != 0 && pkt_cid != current_cid {
+                                        continue;
+                                    }
+                                    if pkt_inst == my_instance_id {
+                                        continue;
+                                    }
+                                    // Leftovers of a stream that was just stopped must not re-open it.
+                                    if is_stream_recently_stopped(pkt_uid) {
+                                        continue;
+                                    }
+                                    last_stream_activity.insert(pkt_uid, Instant::now());
+                                    if len >= 39 {
+                                        let seq = u32::from_be_bytes(recv_buf[25..29].try_into().unwrap());
+                                        let pts_ms = u32::from_be_bytes(recv_buf[29..33].try_into().unwrap());
+                                        let total = u16::from_be_bytes(recv_buf[33..35].try_into().unwrap());
+                                        let total_frame_len = u32::from_be_bytes(recv_buf[35..39].try_into().unwrap_or([0; 4])) as usize;
+                                        let parity_data = recv_buf[39..len].to_vec();
+
+                                        let user_frames = in_flight.entry(pkt_uid).or_insert_with(HashMap::new);
+                                        let frame_entry = user_frames.entry(seq).or_insert_with(|| InFlightFrame {
+                                            total_chunks: total,
+                                            total_len: total_frame_len,
+                                            pts_ms,
+                                            received: HashMap::with_capacity(total as usize),
+                                            parity: None,
+                                            first_seen: Instant::now(),
+                                        });
+                                        frame_entry.total_chunks = total;
+                                        frame_entry.total_len = total_frame_len;
+                                        frame_entry.parity = Some(parity_data);
+
+                                        if frame_entry.received.len() == (total as usize).saturating_sub(1) {
+                                            let mut complete_frame = Vec::new();
+                                            let mut missing_idx = None;
+                                            for i in 0..total {
+                                                if !frame_entry.received.contains_key(&i) { missing_idx = Some(i); break; }
+                                            }
+
+                                            if let Some(m_idx) = missing_idx {
+                                                if let Some(parity) = frame_entry.parity.as_ref() {
+                                                    let mut recovered = parity.clone();
+                                                    for (&_c_i, chunk) in &frame_entry.received {
+                                                        for (i, &b) in chunk.iter().enumerate() {
+                                                            if i < recovered.len() { recovered[i] ^= b; }
+                                                        }
+                                                    }
+                                                    if m_idx == total.saturating_sub(1) && frame_entry.total_len > 0 {
+                                                        let expected_last_len = frame_entry.total_len.saturating_sub((total as usize - 1) * CHUNK_SIZE);
+                                                        if expected_last_len > 0 && expected_last_len < recovered.len() {
+                                                            recovered.truncate(expected_last_len);
+                                                        }
+                                                    }
+                                                    frame_entry.received.insert(m_idx, recovered);
+                                                }
+                                            }
+
+                                            for i in 0..total {
+                                                if let Some(c) = frame_entry.received.get(&i) {
+                                                    complete_frame.extend_from_slice(c);
+                                                }
+                                            }
+                                            if frame_entry.total_len > 0 && complete_frame.len() > frame_entry.total_len {
+                                                complete_frame.truncate(frame_entry.total_len);
+                                            }
+                                            user_frames.remove(&seq);
+
+                                            // Only what opens with the key this sender handed us counts: no
+                                            // plaintext, and nothing from streams we did not ask for.
+                                            let final_frame_opt = super::watch::stream_key(pkt_uid)
+                                                .and_then(|k| decrypt_signaling_payload(&k, &complete_frame));
+                                            if final_frame_opt.is_some() {
+                                                super::watch::video_arrived(pkt_uid);
+                                            }
+
+                                            if let Some(valid_frame) = final_frame_opt {
+                                                let last_seq = last_rendered_seq.get(&pkt_uid).copied().unwrap_or(0);
+                                                let is_newer = seq > last_seq || (last_seq.wrapping_sub(seq) > 0x8000_0000);
+
+                                                if is_newer || last_rendered_seq.get(&pkt_uid).is_none() {
+                                                    last_rendered_seq.insert(pkt_uid, seq);
+
+                                                    let prev_state = active_streaming_users.insert(pkt_uid, true);
+                                                    if prev_state != Some(true) {
+                                                        info!("📡 [AUTO-ATIVAÇÃO STREAM FEC] Usuário {} iniciou transmissão de tela (quadro recuperado via FEC)!", pkt_uid);
+                                                        on_state_arc(pkt_uid, true);
+                                                    }
+
+                                                    let qos = qos_windows.entry(pkt_uid).or_default();
+                                                    qos.frames_received += 1;
+                                                    qos.fec_recovered += 1;
+                                                    last_stream_activity.insert(pkt_uid, Instant::now());
+
+                                                    let uname = peer_names.get(&pkt_uid).cloned().unwrap_or_else(|| format!("Usuário {}", pkt_uid));
+                                                    let fps_val = peer_fps.get(&pkt_uid).copied().unwrap_or(60);
+
+                                                    let q_item = QueuedVideoFrame {
+                                                        peer_uid: pkt_uid,
+                                                        peer_name: uname,
+                                                        peer_fps: fps_val,
+                                                        seq,
+                                                        pts_ms,
+                                                        frame_data: valid_frame,
+                                                    };
+
+                                                    if let Err(std::sync::mpsc::TrySendError::Full(_)) = tx_decode.try_send(q_item) {
+                                                        queue_full_dropped += 1;
+                                                        mark_decode_resync(pkt_uid);
+                                                        if queue_full_last.elapsed() >= Duration::from_secs(1) {
+                                                            log::warn!("⚠️ [JITTER BUFFER] Fila de decodificação cheia ({} quadros): {} quadro(s) descartado(s) (último: {}); pedindo Keyframe ao transmissor {}", DECODE_QUEUE_FRAMES, queue_full_dropped, seq, pkt_uid);
+                                                            queue_full_dropped = 0;
+                                                            queue_full_last = Instant::now();
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                OP_KEYFRAME_REQ => {
+                                    if is_tx_running.load(Ordering::Relaxed) {
+                                        let is_for_me = if len >= 33 {
+                                            let target_uid = u64::from_be_bytes(recv_buf[25..33].try_into().unwrap());
+                                            target_uid == my_uid || target_uid == 0
+                                        } else {
+                                            true
+                                        };
+                                        if is_for_me && keyframe_last_honored.elapsed() >= Duration::from_secs(1) {
+                                            keyframe_last_honored = Instant::now();
+                                            info!("⚡ [KEYFRAME REQ RECEBIDO] Receptor UID={} solicitou IDR Keyframe imediato!", pkt_uid);
+                                            KEYFRAME_REQUESTED.store(true, Ordering::Relaxed);
+                                        }
+                                    }
+                                }
+                                OP_QOS_FEEDBACK => {
+                                    if len >= 35 && is_tx_running.load(Ordering::Relaxed) {
+                                        let target_peer = u64::from_be_bytes(recv_buf[25..33].try_into().unwrap());
+                                        if target_peer == my_uid {
+                                            // The sender's rate follows the worst current viewer (screen-capture-tx).
+                                            let loss_permille = u16::from_be_bytes(recv_buf[33..35].try_into().unwrap());
+                                            super::watch::on_loss_report(pkt_uid, loss_permille);
+                                        }
+                                    }
+                                }
+                                OP_WATCH => {
+                                    if len >= 65 && is_tx_running.load(Ordering::Relaxed) && u64::from_be_bytes(recv_buf[25..33].try_into().unwrap()) == my_uid {
+                                        let viewer_public: [u8; 32] = recv_buf[33..65].try_into().unwrap();
+                                        let in_channel = in_my_voice_channel(pkt_uid, my_current_cid);
+                                        match super::watch::on_watch(pkt_uid, viewer_public, src_addr, in_channel) {
+                                            Some(super::watch::Verdict::Accepted { new }) => {
+                                                if new {
+                                                    info!("👀 [ASSISTIR SOB DEMANDA] UID={} começou a assistir (de {}).", pkt_uid, src_addr);
+                                                    KEYFRAME_REQUESTED.store(true, Ordering::Relaxed);
+                                                    wake_tx();
+                                                }
+                                                let wrapped = super::watch::session_key().zip(pair_key(&viewer_public, my_uid, pkt_uid, my_current_cid))
+                                                    .and_then(|(stream_key, pair)| encrypt_signaling_payload(&pair, &stream_key));
+                                                if let Some(wrapped) = wrapped {
+                                                    let mut ack = Vec::with_capacity(125);
+                                                    ack.extend_from_slice(MAGIC);
+                                                    ack.extend_from_slice(&my_instance_id.to_be_bytes());
+                                                    ack.push(OP_WATCH_ACK);
+                                                    ack.extend_from_slice(&my_current_cid.to_be_bytes());
+                                                    ack.extend_from_slice(&my_uid.to_be_bytes());
+                                                    ack.extend_from_slice(&pkt_uid.to_be_bytes());
+                                                    ack.extend_from_slice(&get_or_create_local_ecdh_keypair());
+                                                    ack.extend_from_slice(&wrapped);
+                                                    let _ = socket.send_to(&ack, src_addr);
+                                                }
+                                            }
+                                            Some(refused) => {
+                                                static REFUSED: crate::utils::logger::LogThrottle = crate::utils::logger::LogThrottle::new(5000);
+                                                if let Some(n) = REFUSED.hit() {
+                                                    warn!("🚫 [ASSISTIR SOB DEMANDA] Pedido de UID={} ({}) recusado: {:?} ({} desde o último aviso)", pkt_uid, src_addr, refused, n);
+                                                }
+                                            }
+                                            None => {}
+                                        }
+                                    }
+                                }
+                                OP_UNWATCH => {
+                                    if len >= 33 && u64::from_be_bytes(recv_buf[25..33].try_into().unwrap()) == my_uid {
+                                        if super::watch::on_unwatch(pkt_uid) {
+                                            info!("👀 [ASSISTIR SOB DEMANDA] UID={} parou de assistir.", pkt_uid);
+                                        }
+                                    }
+                                }
+                                OP_WATCH_ACK => {
+                                    if len >= 125 && u64::from_be_bytes(recv_buf[25..33].try_into().unwrap()) == my_uid {
+                                        let sender_public: [u8; 32] = recv_buf[33..65].try_into().unwrap();
+                                        let key = pair_key(&sender_public, my_uid, pkt_uid, my_current_cid)
+                                            .and_then(|pair| decrypt_signaling_payload(&pair, &recv_buf[65..125]))
+                                            .and_then(|k| <[u8; 32]>::try_from(k.as_slice()).ok());
+                                        if let Some(key) = key {
+                                            if super::watch::stream_key(pkt_uid) != Some(key) {
+                                                info!("🔑 [ASSISTIR SOB DEMANDA] Chave da transmissão de UID={} recebida.", pkt_uid);
+                                                super::watch::set_stream_key(pkt_uid, key);
+                                            }
+                                        }
+                                    }
+                                }
+                                OP_STOP => {
+                                    if len >= 25 {
+                                        let pkt_uid = u64::from_be_bytes(recv_buf[17..25].try_into().unwrap());
+                                        // Only the sender (proved by the stream key) ends its stream; without
+                                        // the key (not watching), the signaling server and the activity timeout do.
+                                        if pkt_inst != my_instance_id && super::watch::is_authentic_stop(super::watch::stream_key(pkt_uid), &recv_buf[25..len]) {
+                                            // The sender repeats OP_STOP in a burst; tear down once.
+                                            let was = active_streaming_users.insert(pkt_uid, false);
+                                            in_flight.remove(&pkt_uid);
+                                            last_rendered_seq.remove(&pkt_uid);
+                                            last_stream_activity.remove(&pkt_uid);
+                                            if was != Some(false) {
+                                                info!("📡 Usuário {} encerrou a transmissão de tela via UDP OP_STOP.", pkt_uid);
+                                                trigger_stream_stopped(pkt_uid);
+                                            }
+                                        }
+                                    }
+                                }
+                                OP_AUDIO_FRAME => {
+                                    if len >= 40 {
+                                        if pkt_inst == my_instance_id {
+                                            continue;
+                                        }
+                                        // One Opus frame (stream_audio), decoded to 48 kHz mono.
+                                        let audio_seq = u32::from_be_bytes(recv_buf[25..29].try_into().unwrap());
+                                        let Some(opus_frame) = super::watch::stream_key(pkt_uid).and_then(|k| decrypt_signaling_payload(&k, &recv_buf[40..len])) else {
+                                            continue;
+                                        };
+                                        let Some(decoder) = (match audio_decoders.entry(pkt_uid) {
+                                            std::collections::hash_map::Entry::Occupied(e) => Some(e.into_mut()),
+                                            std::collections::hash_map::Entry::Vacant(e) => super::stream_audio::StreamAudioDecoder::new().map(|d| e.insert(d)),
+                                        }) else {
+                                            continue;
+                                        };
+                                        let samples_i16 = decoder.decode(audio_seq, &opus_frame);
+                                        let sample_rate = 48_000u32;
+                                        let sample_count = samples_i16.len();
+
+                                        let mut peak_rx: i16 = 0;
+                                        for &s in &samples_i16 {
+                                            let abs = s.saturating_abs();
+                                            if abs > peak_rx { peak_rx = abs; }
+                                        }
+
+                                        static RX_AUDIO_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+                                        let c = RX_AUDIO_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+                                        if c < 3 || c % 1000 == 0 {
+                                            info!("🔊 [STREAM AUDIO RX] Pkt #{} de UID={} | Amostras={} @ {}Hz | Peak Amplitude: {}/32767 | Vol={:.2}", c, pkt_uid, sample_count, sample_rate, peak_rx, get_stream_volume(pkt_uid));
+                                        }
+
+                                        let pts_ms = u32::from_be_bytes(recv_buf[29..33].try_into().unwrap());
+                                        update_audio_clock_pts(pts_ms);
+                                        let vol = get_stream_volume(pkt_uid);
+                                        if vol > 0.001 && !samples_i16.is_empty() {
+                                            let is_voice_active = crate::gateway::is_connected_to_voice();
+
+                                            if is_voice_active {
+                                                // 1. Direct feed EXCLUSIVELY to Voice Gateway Master Speaker Mixer (SSRC 0x8000_5354)
+                                                let stream_ssrc: u32 = 0x8000_5354;
+                                                if let Ok(mut queues) = crate::gateway::get_speaker_pcm_queues().lock() {
+                                                    let q = queues.entry(stream_ssrc).or_insert_with(|| std::collections::VecDeque::with_capacity(48000));
+                                                    if q.len() > 9600 {
+                                                        let excess = q.len() - 4800;
+                                                        q.drain(0..excess);
+                                                        let fade_len = 32.min(q.len());
+                                                        for i in 0..fade_len {
+                                                            let factor = i as f32 / fade_len as f32;
+                                                            let (l, r) = q[i];
+                                                            q[i] = (l * factor, r * factor);
+                                                        }
+                                                    }
+                                                    if sample_rate == 48000 || sample_rate == 0 {
+                                                        for s in &samples_i16 {
+                                                            let f = (*s as f32 / 32768.0) * vol;
+                                                            q.push_back((f, f));
+                                                        }
+                                                    } else {
+                                                        let ratio = 48000.0 / (sample_rate as f32);
+                                                        let out_count = ((samples_i16.len() as f32) * ratio).round() as usize;
+                                                        for j in 0..out_count {
+                                                            let src_idx = (j as f32) / ratio;
+                                                            let i0 = (src_idx.floor() as usize).min(samples_i16.len() - 1);
+                                                            let i1 = (i0 + 1).min(samples_i16.len() - 1);
+                                                            let frac = src_idx - (i0 as f32);
+                                                            let s = (samples_i16[i0] as f32) * (1.0 - frac) + (samples_i16[i1] as f32) * frac;
+                                                            let f = (s / 32768.0) * vol;
+                                                            q.push_back((f, f));
+                                                        }
+                                                    }
+                                                }
+                                                // Clear standalone queue so it never contains leftover echoes
+                                                if let Ok(mut q_guard) = get_stream_audio_queue().lock() {
+                                                    if !q_guard.is_empty() {
+                                                        q_guard.clear();
+                                                    }
+                                                }
+                                            } else {
+                                                // 2. Direct feed to Standalone Stream Audio Queue ONLY when not in a voice call
+                                                mark_stream_audio_activity();
+                                                ensure_stream_audio_playback_started();
+                                                let queue = get_stream_audio_queue();
+                                                let mut q_guard = queue.lock().unwrap_or_else(|e| e.into_inner());
+                                                if q_guard.len() > 4800 {
+                                                    let excess = q_guard.len() - 2400;
+                                                    q_guard.drain(0..excess);
+                                                    let fade_len = 32.min(q_guard.len());
+                                                    for i in 0..fade_len {
+                                                        let factor = i as f32 / fade_len as f32;
+                                                        q_guard[i] *= factor;
+                                                    }
+                                                }
+
+                                                if sample_rate == 48000 || sample_rate == 0 {
+                                                    for s in &samples_i16 {
+                                                        q_guard.push_back((*s as f32 / 32768.0) * vol);
+                                                    }
+                                                } else {
+                                                    let ratio = 48000.0 / (sample_rate as f32);
+                                                    let out_count = ((samples_i16.len() as f32) * ratio).round() as usize;
+                                                    for j in 0..out_count {
+                                                        let src_idx = (j as f32) / ratio;
+                                                        let i0 = (src_idx.floor() as usize).min(samples_i16.len() - 1);
+                                                        let i1 = (i0 + 1).min(samples_i16.len() - 1);
+                                                        let frac = src_idx - (i0 as f32);
+                                                        let s = (samples_i16[i0] as f32) * (1.0 - frac) + (samples_i16[i1] as f32) * frac;
+                                                        q_guard.push_back((s / 32768.0) * vol);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                            break;
+                        }
+                        #[cfg(target_os = "windows")]
+                        Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                            // Ignora ICMP Port/Host Unreachable (WSAECONNRESET 10054) no socket UDP
+                            continue;
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                if packets_drained == 0 {
+                    idle_iterations = idle_iterations.saturating_add(1);
+                    if idle_iterations >= 160 {
+                        // A stream that went quiet keeps the 20 ms wait so it can expire.
+                        // In a call without streams, wake once a second for the heartbeat
+                        // and QoS. Outside a call there is nothing to send: sleep until a
+                        // packet arrives (`notify_p2p_context_changed` sends one on join).
+                        let any_stream = active_streaming_users.values().any(|&on| on);
+                        let wanted = if any_stream {
+                            Some(Duration::from_millis(20))
+                        } else if in_call {
+                            Some(Duration::from_millis(1000))
+                        } else {
+                            None
+                        };
+                        if idle_timeout != Some(wanted) {
+                            let _ = socket.set_read_timeout(wanted);
+                            idle_timeout = Some(wanted);
+                        }
+                    } else {
+                        std::thread::sleep(Duration::from_millis(4));
+                    }
+                } else {
+                    idle_iterations = 0;
+                    if idle_timeout.is_some() {
+                        let _ = socket.set_read_timeout(Some(Duration::from_millis(2)));
+                        idle_timeout = None;
+                    }
+                }
+
+                    // Check stream timeouts (> 2500ms sem quadros)
+                    let now = Instant::now();
+                    let mut expired = Vec::new();
+                    for (&uid, &last_act) in last_stream_activity.iter() {
+                        if now.duration_since(last_act) > Duration::from_millis(2500) {
+                            expired.push(uid);
+                        }
+                    }
+                    for uid in expired {
+                        last_stream_activity.remove(&uid);
+                        if active_streaming_users.insert(uid, false) != Some(false) {
+                            info!("📡 Stream do usuário {} expirou por inatividade (2.5s sem quadros).", uid);
+                            last_rendered_seq.remove(&uid);
+                            in_flight.remove(&uid);
+                            trigger_stream_stopped(uid);
+                        }
+                    }
+                    crate::utils::timer_resolution::set_stream_rx_active(!last_stream_activity.is_empty());
+                }
+            })
+            .expect("Failed to start RX thread");
+    }
+}
+
+/// Capture and send pace while nobody watches: the local preview's rate.
+pub(super) const IDLE_FRAME_INTERVAL: Duration = Duration::from_millis(250);
+/// With nothing new on screen, how often the last picture is sent again (10 per second).
+/// Encoding the same picture on every tick cost a core ~10% on a still screen for
+/// nothing; Sunshine also lowers the rate of repeats. Native viewers drop a stream after
+/// 2.5 s without frames, so repeats cannot stop altogether.
+const STILL_REPEAT_EVERY: Duration = Duration::from_millis(100);
+
+/// The stream's send thread, woken when a viewer arrives.
+static TX_THREAD: Mutex<Option<std::thread::Thread>> = Mutex::new(None);
+
+/// Wakes the send thread now (it sleeps up to a quarter second while nobody watches).
+pub(crate) fn wake_tx() {
+    if let Some(t) = TX_THREAD.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        t.unpark();
+    }
+}
+
+/// Somebody watches the stream being sent (natively or in a browser); read by the
+/// capture thread to choose its pace.
+static TX_WATCHED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(windows)]
+pub(super) fn tx_watched() -> bool {
+    TX_WATCHED.load(Ordering::Relaxed)
+}
+
+/// How long the send thread waits for the picture it just handed to the encoder thread
+/// (usually a few milliseconds). A slower encoder does not hold the loop up: its picture
+/// comes out with a later turn.
+#[cfg(windows)]
+const ENCODED_WAIT: Duration = Duration::from_millis(8);
+
+/// A picture the encoder finished after its turn, without handing it a new one.
+#[cfg(windows)]
+fn finished_on_gpu(encoder: &mut Option<(usize, super::gpu_encode_worker::GpuEncodeWorker)>) -> Option<Vec<u8>> {
+    gpu_output(encoder, Duration::ZERO)
+}
+
+/// The encoder's next picture within `wait`; on a failure, back to the CPU path.
+#[cfg(windows)]
+fn gpu_output(encoder: &mut Option<(usize, super::gpu_encode_worker::GpuEncodeWorker)>, wait: Duration) -> Option<Vec<u8>> {
+    match encoder.as_ref()?.1.next_output(wait)? {
+        Ok(bytes) => {
+            super::gpu_tx::confirm();
+            Some(bytes)
+        }
+        Err(e) => {
+            *encoder = None;
+            super::gpu_tx::give_up(&format!("failed to encode with GPU ({e})"));
+            None
+        }
+    }
+}
+
+/// Hands the newest GPU picture to the encoder thread of its device (created on first
+/// use) and returns the oldest finished one, if any. Any failure sends the rest of the
+/// stream back to the CPU path.
+#[cfg(windows)]
+fn encode_on_gpu(
+    encoder: &mut Option<(usize, super::gpu_encode_worker::GpuEncodeWorker)>,
+    frame: Option<&super::gpu_tx::GpuFrame>,
+    fps: u32,
+) -> Option<Vec<u8>> {
+    let f = frame?;
+    if !open_gpu_encoder(encoder, &f.device, f.width, f.height, fps) {
+        return None;
+    }
+    let (_, enc) = encoder.as_mut()?;
+    enc.set_bitrate(REQUESTED_BITRATE_BPS.load(Ordering::Relaxed));
+    if KEYFRAME_REQUESTED.swap(false, Ordering::Relaxed) {
+        enc.force_idr();
+    }
+    enc.submit(f);
+    gpu_output(encoder, ENCODED_WAIT)
+}
+
+/// Opens the texture encoder of `device` unless it is open already. Opening Quick Sync
+/// takes over half a second, so this runs as soon as the capture knows its device rather
+/// than when the first viewer arrives. False (and the CPU path) when it cannot open.
+#[cfg(windows)]
+fn open_gpu_encoder(
+    encoder: &mut Option<(usize, super::gpu_encode_worker::GpuEncodeWorker)>,
+    device: &::windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> bool {
+    use ::windows::core::Interface;
+    let key = device.as_raw() as usize;
+    if encoder.as_ref().is_some_and(|(k, _)| *k == key) {
+        return true;
+    }
+    let vendor = super::gpu_tx::vendor_of(device).unwrap_or(0);
+    match crate::encoder::create_gpu_encoder(device, vendor, width, height, fps, REQUESTED_BITRATE_BPS.load(Ordering::Relaxed)) {
+        Ok(e) => {
+            *encoder = Some((key, super::gpu_encode_worker::GpuEncodeWorker::new(e)));
+            true
+        }
+        Err(e) => {
+            super::gpu_tx::give_up(&format!("codificador pela GPU indisponível ({e})"));
+            false
+        }
+    }
+}
+
+/// How long a capture loop waits between frames: the stream's pace while somebody
+/// watches, the preview's otherwise.
+pub(super) fn capture_pace(frame_interval: Duration) -> Duration {
+    if TX_WATCHED.load(Ordering::Relaxed) { frame_interval } else { IDLE_FRAME_INTERVAL.max(frame_interval) }
+}
+
+/// The highest bitrate a stream starts at and climbs back to.
+const MAX_STREAM_BITRATE: u32 = 8_000_000;
+
+/// `uid` is in the voice channel `cid` (gateway voice states).
+fn in_my_voice_channel(uid: u64, cid: u64) -> bool {
+    cid != 0
+        && crate::gateway::get_guild_voice_states_store()
+            .lock()
+            .map(|m| m.get(&uid).is_some_and(|c| c.parse::<u64>().ok() == Some(cid)))
+            .unwrap_or(false)
+}
+
+/// Every address we know for `uid`: the last one its packets came from, and the ones its
+/// signaling presence announced.
+fn peer_addrs(uid: u64, peers_store: &Arc<Mutex<HashMap<u64, (SocketAddr, Instant)>>>) -> Vec<SocketAddr> {
+    let mut out = Vec::new();
+    if let Some(a) = LAST_SEEN_PEER_ADDR.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&uid).copied())) {
+        out.push(a);
+    }
+    if let Ok(peers) = peers_store.lock() {
+        for (&k, &(a, _)) in peers.iter() {
+            // Presence entries are keyed by uid mixed with the instance in the high bits.
+            let same = k == uid || (k & 0xFFFF_FFFF) as u32 == (uid as u32) || k == uid.wrapping_add(0x8000_0000_0000_0000);
+            if same && !out.contains(&a) && !is_tailscale_or_forbidden(&a) {
+                out.push(a);
+            }
+        }
+    }
+    out
+}
+
+fn mark_decode_resync(peer_uid: u64) {
+    if let Ok(mut peers) = DECODE_RESYNC.lock() {
+        if !peers.contains(&peer_uid) {
+            peers.push(peer_uid);
+        }
+    }
+}
+
+fn take_decode_resync(peer_uid: u64) -> bool {
+    match DECODE_RESYNC.lock() {
+        Ok(mut peers) => match peers.iter().position(|&p| p == peer_uid) {
+            Some(i) => {
+                peers.swap_remove(i);
+                true
+            }
+            None => false,
+        },
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod decode_resync_tests {
+    use super::*;
+
+    #[test]
+    fn resync_mark_is_taken_once_per_peer() {
+        mark_decode_resync(7);
+        mark_decode_resync(7);
+        mark_decode_resync(8);
+        assert!(take_decode_resync(7));
+        assert!(!take_decode_resync(7));
+        assert!(take_decode_resync(8));
+        assert!(!take_decode_resync(9));
+    }
+}

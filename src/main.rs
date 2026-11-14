@@ -1,0 +1,4839 @@
+﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![allow(ambiguous_glob_reexports, unused_imports)]
+
+pub mod auth;
+pub mod audio;
+pub mod ui;
+pub mod utils;
+pub mod gateway;
+pub mod http;
+pub mod channel_permissions;
+pub mod encoder;
+pub mod screen_capture;
+#[cfg(feature = "automation")]
+mod automation;
+
+// Convenient re-exports for modules and root scope
+pub use auth::*;
+pub use audio::*;
+pub use ui::*;
+pub use utils::*;
+pub use gateway::*;
+pub use http::*;
+pub use encoder::*;
+pub use screen_capture::*;
+
+use slint::{SharedString, Model, Image, SharedPixelBuffer, Rgba8Pixel};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::collections::HashMap;
+use tokio::sync::mpsc;
+use log::{info, warn, error};
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Has mimalloc commit heap pages as they are used instead of whole at once. Measured with
+/// a 1080p60 stream: 50 to 60 MB less private memory on each side for the same CPU, and a
+/// thread that exits leaves about 0.13 MB behind instead of 0.57 MB.
+fn commit_heap_pages_on_demand() {
+    extern "C" {
+        fn mi_option_set(option: i32, value: std::os::raw::c_long);
+    }
+    // mi_option_page_commit_on_demand in the mimalloc v3 headers of libmimalloc-sys 0.1.49
+    // (the crate has no constant for it).
+    const MI_OPTION_PAGE_COMMIT_ON_DEMAND: i32 = 40;
+    unsafe { mi_option_set(MI_OPTION_PAGE_COMMIT_ON_DEMAND, 1) };
+}
+use tray_icon::{TrayIconEvent, menu::MenuEvent, MouseButton};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    ShowWindow, SetForegroundWindow, SetWindowPos,
+    SW_HIDE, SW_SHOW, SW_RESTORE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, HWND_TOP
+};
+
+slint::include_modules!();
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    commit_heap_pages_on_demand();
+    let _tokio_guard = tokio::runtime::Handle::current().enter();
+
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    let _ = i_slint_backend_winit::set_xdg_app_id("kiyora");
+
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .thread_name(|i| format!("rayon-worker-{}", i))
+        .start_handler(|i| {
+            #[cfg(target_os = "windows")]
+            crate::cpu_profiler::set_current_thread_name(&format!("rayon-worker-{}", i));
+        })
+        .build_global();
+
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use windows_sys::Win32::System::LibraryLoader::{SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32};
+        let _ = SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+        use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+
+    std::panic::set_hook(Box::new(|info| {
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown".to_string()
+        };
+        let location = info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column())).unwrap_or_default();
+        let msg = format!("💥 PANIC DETECTED: {}\nLocation: {}\n", payload, location);
+        eprintln!("{}", msg);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("panic_log.txt") {
+            use std::io::Write;
+            let _ = writeln!(f, "{}", msg);
+        }
+    }));
+
+    attachment_cache::cleanup_temp_attachments();
+    let _ = std::fs::remove_file("panic_log.txt");
+
+    init_logger();
+
+    cpu_profiler::start_thread_cpu_profiler();
+    cpu_profiler::set_current_thread_name("main-ui-thread");
+
+    // 1 ms timer resolution is requested only while voice/streams need it.
+    utils::timer_resolution::start_timer_resolution_governor();
+
+    info!("==================================================================");
+    info!("🚀 kiyora STARTED | VERSION: v{} ({})", env!("CARGO_PKG_VERSION"), env!("kiyora_GIT_HASH"));
+    info!("==================================================================");
+
+    // Renderer: software unless the user turned on GPU rendering (an explicit
+    // SLINT_BACKEND, e.g. from a test script, still wins).
+    if std::env::var_os("SLINT_BACKEND").is_none() && !video_settings::get_use_gpu_renderer() {
+        std::env::set_var("SLINT_BACKEND", "winit-software");
+    }
+    info!("🖥️ Initializing Slint AppWindow (renderizador: {})...",
+        std::env::var("SLINT_BACKEND").unwrap_or_else(|_| "GPU".to_string()));
+    let app = match AppWindow::new() {
+        Ok(app) => {
+            info!("🖥️ Showing main window (app.show())...");
+            if let Err(e) = app.show() {
+                log::warn!("⚠️ Failed to show window with GPU ({:?}). Enabling automatic fallback to Software Renderer...", e);
+                std::env::set_var("SLINT_BACKEND", "software");
+                let sw_app = AppWindow::new()?;
+                sw_app.show()?;
+                info!("🖥️ Slint window displayed successfully via Software Renderer!");
+                sw_app
+            } else {
+                info!("🖥️ Slint window displayed successfully!");
+                app
+            }
+        }
+        Err(e) => {
+            log::warn!("⚠️ Failed to initialize graphics backend ({:?}). Enabling automatic fallback to Software Renderer...", e);
+            std::env::set_var("SLINT_BACKEND", "software");
+            let sw_app = AppWindow::new()?;
+            sw_app.show()?;
+            info!("🖥️ Slint window displayed successfully via Software Renderer!");
+            sw_app
+        }
+    };
+
+    let initial_lang = i18n::load_persisted_language_config();
+    apply_i18n_translations(&app, initial_lang);
+    info!("🌐 Initial language configured: {:?}", initial_lang);
+    #[cfg(feature = "automation")]
+    automation::start(&app);
+
+    #[cfg(target_os = "linux")]
+    {
+        app.set_is_linux(true);
+    }
+
+    let saved_audio_cfg = gateway::load_persisted_audio_config();
+    app.set_vad_threshold(saved_audio_cfg.vad_threshold);
+    app.set_mic_volume(saved_audio_cfg.mic_volume);
+    app.set_app_version(updater::get_local_version_string().into());
+
+    let initial_keybinds = keybinds::load_persisted_keybinds_config();
+    app.set_keybind_mute_str(initial_keybinds.mute_shortcut.clone().into());
+    app.set_keybind_deafen_str(initial_keybinds.deafen_shortcut.clone().into());
+    let keybind_mgr = Arc::new(keybinds::KeybindManager::new(initial_keybinds));
+    sound_effects::init_sound_effects();
+    populate_video_interface_settings(&app);
+    populate_voice_processing_settings(&app);
+    populate_network_proxy_settings(&app);
+
+    let app_weak = app.as_weak();
+    #[cfg(windows)]
+    {
+        let weak = app_weak.clone();
+        screen_capture::gpu_capture::set_status_callback(Arc::new(move || {
+            let weak = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = weak.upgrade() {
+                    crate::ui::helpers::refresh_stream_capture_status(&ui);
+                }
+            });
+        }));
+    }
+    avatar_cache::get_avatar_cache().set_app(app_weak.clone());
+    crate::ui::helpers::set_channel_emoji_app(app_weak.clone());
+
+    let popout_window = PopoutStreamWindow::new()?;
+    let popout_weak = popout_window.as_weak();
+    let popout_hwnd_store: Arc<Mutex<Option<isize>>> = Arc::new(Mutex::new(None));
+
+    // Tell the stream decoder whether any window can show a stream, so nothing is decoded
+    // while kiyora sits minimized behind a game. Minimizing and restoring arrive as
+    // resizes (on Windows a minimized window reports a small caption-sized area).
+    {
+        use i_slint_backend_winit::{EventResult, WinitWindowAccessor};
+        let has_area = |window: &slint::Window, ev: &winit::event::WindowEvent| match ev {
+            winit::event::WindowEvent::Resized(s) => {
+                let minimized = window.with_winit_window(|w| w.is_minimized()).flatten().unwrap_or(false);
+                Some(!minimized && s.width > 0 && s.height > 0)
+            }
+            _ => None,
+        };
+        // The same changes decide whether a window shows its stream through the GPU.
+        let refresh_gpu_video = {
+            let (aw, pw) = (app_weak.clone(), popout_weak.clone());
+            move || {
+                if let (Some(a), Some(p)) = (aw.upgrade(), pw.upgrade()) {
+                    crate::ui::gpu_video::refresh(&a, &p);
+                }
+            }
+        };
+        let refresh_main = refresh_gpu_video.clone();
+        let main_had_area = std::cell::Cell::new(true);
+        let main_weak = app_weak.clone();
+        app.window().on_winit_window_event(move |window, ev| {
+            if let Some(has) = has_area(window, ev) {
+                if has && !main_had_area.replace(has) {
+                    i_slint_backend_winit::redraw_whole_window(window);
+                }
+                screen_capture::set_main_window_has_area(has);
+                refresh_main();
+            }
+            if matches!(ev, winit::event::WindowEvent::Moved(_) | winit::event::WindowEvent::Resized(_)) {
+                crate::ui::window_place::observe(&main_weak);
+                window.with_winit_window(|w| {
+                    // Maximizing also happens outside the title bar button (Win+Up, snapping).
+                    if let Some(ui) = main_weak.upgrade() {
+                        if ui.get_is_maximized() != w.is_maximized() {
+                            ui.set_is_maximized(w.is_maximized());
+                        }
+                    }
+                });
+            }
+            EventResult::Propagate
+        });
+        let (aw, pw) = (app_weak.clone(), popout_weak.clone());
+        let popout_had_area = std::cell::Cell::new(true);
+        popout_window.window().on_winit_window_event(move |window, ev| {
+            if let Some(has) = has_area(window, ev) {
+                if has && !popout_had_area.replace(has) {
+                    i_slint_backend_winit::redraw_whole_window(window);
+                }
+                screen_capture::set_popout_has_area(has);
+                if let (winit::event::WindowEvent::Resized(s), Some(a), Some(p)) = (ev, aw.upgrade(), pw.upgrade()) {
+                    crate::ui::gpu_video::popout_resized(&a, &p, s.width, s.height);
+                }
+            }
+            EventResult::Propagate
+        });
+        let refresh_pop = refresh_gpu_video.clone();
+        popout_window.on_user_id_changed(move |uid| {
+            screen_capture::set_popout_has_stream(!uid.is_empty());
+            refresh_pop();
+        });
+        let (aw, pw) = (app_weak.clone(), popout_weak.clone());
+        app.on_stream_viewport_changed(move |x, y, w, h| {
+            if let (Some(a), Some(p)) = (aw.upgrade(), pw.upgrade()) {
+                crate::ui::gpu_video::viewport_changed(&a, &p, x, y, w, h);
+            }
+        });
+    }
+
+    let hwnd_store: Arc<Mutex<Option<isize>>> = Arc::new(Mutex::new(None));
+    utils::start_hardware_monitor_loop(app_weak.clone(), Arc::clone(&hwnd_store));
+
+
+    use i_slint_backend_winit::WinitWindowAccessor;
+    let app_weak_init = app_weak.clone();
+    let hwnd_store_init = Arc::clone(&hwnd_store);
+    let popout_weak_init = popout_weak.clone();
+    let pop_hwnd_c = Arc::clone(&popout_hwnd_store);
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = app_weak_init.upgrade() {
+            ui.window().with_winit_window(|winit_win| {
+                info!("🖥️ [EVENT LOOP] Configuring Winit window on initial event...");
+                if crate::ui::window_place::restore(winit_win) {
+                    ui.set_is_maximized(true);
+                }
+                winit_win.set_visible(true);
+                winit_win.set_minimized(false);
+                // A frameless window gets no drop shadow, so over another light window its
+                // edges disappeared. The shadow is drawn by the Windows compositor (DWM),
+                // outside the app's own rendering, so it costs no CPU, GPU or memory here.
+                #[cfg(target_os = "windows")]
+                {
+                    use winit::platform::windows::WindowExtWindows;
+                    winit_win.set_undecorated_shadow(true);
+                }
+                winit_win.focus_window();
+                winit_win.request_redraw();
+                if let Some(pop_win) = popout_weak_init.upgrade() {
+                    pop_win.window().with_winit_window(|winit_pop| {
+                        winit_pop.set_decorations(false);
+                        let _ = winit_pop.request_inner_size(winit::dpi::LogicalSize::new(640.0, 360.0));
+                        winit_pop.set_min_inner_size(Some(winit::dpi::LogicalSize::new(180.0, 100.0)));
+                        winit_pop.set_visible(false);
+                        #[cfg(target_os = "windows")]
+                        {
+                            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                            if let Ok(handle) = winit_pop.window_handle() {
+                                if let RawWindowHandle::Win32(win32_handle) = handle.as_raw() {
+                                    let hwnd = win32_handle.hwnd.get() as isize;
+                                    *pop_hwnd_c.lock().unwrap() = Some(hwnd);
+                                    set_dark_titlebar_color(hwnd);
+                                    unsafe {
+                                        use windows_sys::Win32::UI::WindowsAndMessaging::{
+                                            GetWindowLongPtrW, SetWindowLongPtrW, GWL_STYLE, WS_THICKFRAME, WS_MINIMIZEBOX, WS_MAXIMIZEBOX
+                                        };
+                                        let style = GetWindowLongPtrW(hwnd as _, GWL_STYLE) as u32;
+                                        SetWindowLongPtrW(hwnd as _, GWL_STYLE, (style | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX) as isize);
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+
+                // Set native window and taskbar/dock icon (Linux X11/Wayland & Windows)
+                let icon_bytes = include_bytes!("../assets/app_icon.png");
+                if let Ok(img) = image::load_from_memory(icon_bytes) {
+                    let rgba = img.into_rgba8();
+                    let (width, height) = rgba.dimensions();
+                    if let Ok(winit_icon) = winit::window::Icon::from_rgba(rgba.into_raw(), width, height) {
+                        winit_win.set_window_icon(Some(winit_icon));
+                    }
+                }
+
+                #[cfg(target_os = "windows")]
+                {
+                    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                    if let Ok(handle) = winit_win.window_handle() {
+                        if let RawWindowHandle::Win32(win32_handle) = handle.as_raw() {
+                            let hwnd = win32_handle.hwnd.get() as isize;
+                            *hwnd_store_init.lock().unwrap() = Some(hwnd);
+                            set_dark_titlebar_color(hwnd);
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    winit_win.set_decorations(true);
+                }
+            });
+            ui.window().request_redraw();
+            if let Some(pop_win) = popout_weak_init.upgrade() {
+                crate::ui::gpu_video::install(&ui, &pop_win);
+            }
+        }
+    });
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let app_weak_pulse = app_weak.clone();
+        tokio::spawn(async move {
+            for _ in 0..8 {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let app_w = app_weak_pulse.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = app_w.upgrade() {
+                        ui.window().request_redraw();
+                    }
+                });
+            }
+        });
+    }
+
+    let last_token: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let guilds_map: Arc<Mutex<HashMap<String, GuildData>>> = Arc::new(Mutex::new(HashMap::new()));
+    let cmd_tx_store: Arc<Mutex<Option<mpsc::Sender<GatewayCommand>>>> = Arc::new(Mutex::new(None));
+
+    let selected_input: Arc<Mutex<String>> = Arc::new(Mutex::new(saved_audio_cfg.input_device.clone()));
+    let selected_output: Arc<Mutex<String>> = Arc::new(Mutex::new(saved_audio_cfg.output_device.clone()));
+    if !saved_audio_cfg.input_device.is_empty() {
+        app.set_selected_input_device(saved_audio_cfg.input_device.into());
+    }
+    if !saved_audio_cfg.output_device.is_empty() {
+        gateway::set_selected_output_device(saved_audio_cfg.output_device.clone());
+        app.set_selected_output_device(saved_audio_cfg.output_device.into());
+    }
+    let active_mic_stream: Arc<Mutex<Option<audio::engine::MicCapture>>> = Arc::new(Mutex::new(None));
+    let active_loopback_stream: Arc<Mutex<Option<cpal::Stream>>> = Arc::new(Mutex::new(None));
+
+    let tray = SystemTrayManager::setup();
+    let show_id = tray.show_item_id.clone();
+    let quit_id = tray.quit_item_id.clone();
+
+    // Spawn tray event listener thread
+    let hwnd_store_tray = Arc::clone(&hwnd_store);
+    let app_weak_tray = app_weak.clone();
+    let show_id_c = show_id.clone();
+    let quit_id_c = quit_id.clone();
+    // The tray and menu handlers forward only the events that matter; the thread
+    // sleeps on that channel instead of polling the receivers every 120 ms.
+    // `true` = restore the window, `false` = quit.
+    let (tray_action_tx, tray_action_rx) = std::sync::mpsc::channel::<bool>();
+    let menu_action_tx = tray_action_tx.clone();
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+        info!("Tray MenuEvent recebido: {:?}", event);
+        let action = if event.id == show_id_c {
+            true
+        } else if event.id == quit_id_c {
+            false
+        } else {
+            return;
+        };
+        let _ = menu_action_tx.send(action);
+    }));
+    let icon_action_tx = tray_action_tx;
+    TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+        if matches!(event, TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } | TrayIconEvent::Click { button: MouseButton::Left, .. }) {
+            info!("TrayIconEvent recebido: {:?}", event);
+            let _ = icon_action_tx.send(true);
+        }
+    }));
+    std::thread::Builder::new()
+        .name("tray-listener".into())
+        .spawn(move || {
+            while let Ok(restore) = tray_action_rx.recv() {
+                if !restore {
+                    #[cfg(target_os = "linux")]
+                    screen_capture::kill_portal_child();
+                    std::process::exit(0);
+                }
+
+                APP_IS_VISIBLE.store(true, Ordering::Relaxed);
+                // Watched streams are asked for again right away.
+                screen_capture::types::wake_p2p_receiver();
+                NEED_UI_REFRESH.store(true, Ordering::Relaxed);
+                utils::wake_hardware_monitor();
+                wake_ui_loops();
+                info!("[DeepSleep] Restauração acionada via Tray — acordando UI.");
+
+                let app_weak_inner = app_weak_tray.clone();
+                let _hwnd_store_inner = Arc::clone(&hwnd_store_tray);
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui_inner) = app_weak_inner.upgrade() {
+                        let _ = ui_inner.window().with_winit_window(|winit_win| {
+                            winit_win.set_visible(true);
+                            winit_win.set_minimized(false);
+                            winit_win.focus_window();
+                        });
+                        i_slint_backend_winit::redraw_whole_window(ui_inner.window());
+                    }
+                    #[cfg(target_os = "windows")]
+                    if let Some(hwnd) = *_hwnd_store_inner.lock().unwrap() {
+                        unsafe {
+                            ShowWindow(hwnd as _, SW_SHOW);
+                            ShowWindow(hwnd as _, SW_RESTORE);
+                            SetForegroundWindow(hwnd as _);
+                            SetWindowPos(hwnd as _, HWND_TOP as _, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+                        }
+                    }
+                });
+            }
+        })
+        .expect("Failed to spawn tray listener thread");
+
+
+
+    let http_client: Arc<Mutex<Option<DiscordHttpClient>>> = Arc::new(Mutex::new(None));
+    let active_channel_id: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let active_guild_id: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+
+    // Tokio MPSC Channel for Gateway Events -> Slint UI
+    let (event_tx, mut event_rx) = mpsc::channel::<GatewayEvent>(100);
+
+    // Initial background update check on app launch
+        // Initial background update check on app launch
+    trigger_update_check(app_weak.clone());
+
+    // Background warmup of audio devices cache
+    tokio::task::spawn_blocking(|| {
+        let _ = enumerate_audio_devices();
+    });
+
+    // Tokio MPSC Channel for Microphone Volume Level (0.0 to 1.0)
+    let (level_tx, mut level_rx) = mpsc::channel::<f32>(100);
+
+    // Dispatch Microphone Volume Level to Slint UI Thread (throttled to 15 FPS / 66 ms)
+    let app_weak_level = app_weak.clone();
+    tokio::spawn(async move {
+        let mut last_send = std::time::Instant::now();
+        let mut last_level = -1.0f32;
+        while let Some(level) = level_rx.recv().await {
+            gateway::set_self_mic_level(level);
+            // Only the settings meter shows this value (the voice panel reads the level
+            // directly), so the UI is not woken for it otherwise.
+            if !APP_IS_VISIBLE.load(Ordering::Relaxed) || !MIC_METER_VISIBLE.load(Ordering::Relaxed) {
+                continue;
+            }
+            // Skip UI redraw if microphone was silent and is still silent
+            if level < 0.005 && last_level < 0.005 {
+                continue;
+            }
+            let now = std::time::Instant::now();
+            // 15 FPS is plenty for a level meter and halves the UI wakeups during a call.
+            if now.duration_since(last_send).as_millis() >= 66 {
+                last_send = now;
+                last_level = level;
+                let app_w_inner = app_weak_level.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = app_w_inner.upgrade() {
+                        ui.set_mic_level(level);
+                    }
+                });
+            }
+        }
+    });
+
+    // Voice Room View Focus Toggle & Per-User Audio Callbacks
+    let app_weak_voice_focus = app_weak.clone();
+    app.on_toggle_voice_focus(move || {
+        if let Some(ui) = app_weak_voice_focus.upgrade() {
+            let cur = ui.get_is_voice_focused();
+            let new_val = !cur;
+            ui.set_is_voice_focused(new_val);
+            if !new_val {
+                request_chat_scroll_to_bottom(app_weak_voice_focus.clone());
+            }
+        }
+    });
+
+    let app_weak_open_link = app_weak.clone();
+    app.on_open_link(move |url_str: SharedString| {
+        let url = url_str.trim().to_string();
+        // A link to a channel of the server on screen opens that channel here instead
+        // of the browser (channel mentions are shown as such links).
+        if let Some((_, channel_id)) = gateway::channel_names::channel_link_target(&url) {
+            if let Some(ui) = app_weak_open_link.upgrade() {
+                let on_screen = ui.get_channels().iter().any(|c| c.id.as_str() == channel_id);
+                if on_screen {
+                    ui.invoke_select_channel(channel_id.into());
+                    return;
+                }
+            }
+        }
+        // Strict URL protocol validation: only allow HTTP and HTTPS
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            log::warn!("Tentativa de abrir link não-HTTP rejeitada por segurança: {}", url);
+            return;
+        }
+
+        info!("Abrindo link seguro no navegador padrão: {}", url);
+        #[cfg(target_os = "windows")]
+        unsafe {
+            let op: Vec<u16> = "open\0".encode_utf16().collect();
+            let file: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
+            ShellExecuteW(0, op.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), 1 /* SW_SHOWNORMAL */);
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+        }
+    });
+
+    let app_weak_dl = app_weak.clone();
+    app.on_download_attachment(move |att_id: SharedString, filename: SharedString, url: SharedString| {
+        let cache = attachment_cache::get_attachment_cache();
+        cache.download_full_async(att_id.as_str(), filename.as_str(), url.as_str(), app_weak_dl.clone());
+    });
+
+    // Popout Stream Window Callbacks & Window Manager
+    // Hides the popout's top bar 2.2 s after the last mouse activity. Single-shot and
+    // restarted on activity, so nothing ticks while the popout is closed or idle.
+    let pop_autohide = std::rc::Rc::new(slint::Timer::default());
+    {
+        let pop_w_hide = popout_weak.clone();
+        pop_autohide.start(slint::TimerMode::SingleShot, std::time::Duration::from_millis(2200), move || {
+            if let Some(pop) = pop_w_hide.upgrade() {
+                pop.set_show_controls(false);
+            }
+        });
+        pop_autohide.stop();
+    }
+    let pop_autohide_open = std::rc::Rc::clone(&pop_autohide);
+    let pop_w_cb = popout_weak.clone();
+    let pop_hwnd_cb = Arc::clone(&popout_hwnd_store);
+    let app_weak_pop = app_weak.clone();
+    app.on_popout_stream_window(move |uid_str: slint::SharedString, uname_str: slint::SharedString| {
+        let uid = uid_str.to_string();
+        let uname = uname_str.to_string();
+        info!("📺 Desanexando transmissão de vídeo para janela Popout! User ID: {}, Nome: {}", uid, uname);
+        if let Some(ui) = app_weak_pop.upgrade() {
+            ui.set_popped_out_stream_uid(uid.clone().into());
+            let my_uid = gateway::get_my_user_id().to_string();
+            let is_pop_self = uid == "self" || uid == my_uid;
+            let cur_frame = if is_pop_self { ui.get_active_stream_frame() } else { ui.get_remote_stream_frame() };
+            if let Some(pop_win) = pop_w_cb.upgrade() {
+                pop_win.set_user_id(uid.clone().into());
+                pop_win.set_username(if uname.is_empty() { ui.get_active_stream_user() } else { uname.into() });
+                pop_win.set_stream_frame(cur_frame);
+                pop_win.set_show_controls(true);
+                pop_autohide_open.restart();
+                pop_win.set_is_self(is_pop_self);
+                if is_pop_self && video_settings::get_enable_self_preview_notice() {
+                    pop_win.set_show_self_preview_notice(true);
+                    let pop_w_notice = pop_w_cb.clone();
+                    slint::Timer::single_shot(std::time::Duration::from_secs(8), move || {
+                        if let Some(pop) = pop_w_notice.upgrade() {
+                            pop.set_show_self_preview_notice(false);
+                        }
+                    });
+                } else {
+                    pop_win.set_show_self_preview_notice(false);
+                }
+                let _ = pop_win.show();
+                #[cfg(target_os = "windows")]
+                if let Some(hwnd) = *pop_hwnd_cb.lock().unwrap() {
+                    unsafe {
+                        use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOW, SetForegroundWindow};
+                        ShowWindow(hwnd as _, SW_SHOW);
+                        SetForegroundWindow(hwnd as _);
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let is_p = pop_win.get_is_pinned();
+                    if is_p {
+                        set_linux_window_keep_above(true);
+                    }
+                }
+                let _ = pop_win.window().with_winit_window(|w| {
+                    w.set_visible(true);
+                    w.set_minimized(false);
+                    w.focus_window();
+                });
+                i_slint_backend_winit::redraw_whole_window(pop_win.window());
+                // Shown and restored now (showing a hidden window brings no resize event).
+                screen_capture::set_popout_has_area(true);
+                crate::ui::gpu_video::refresh(&ui, &pop_win);
+            }
+        }
+    });
+
+    let pop_w_pin = popout_weak.clone();
+    let pop_hwnd_pin = Arc::clone(&popout_hwnd_store);
+    if let Some(pop_win) = popout_weak.upgrade() {
+        pop_win.on_toggle_pin(move || {
+            if let Some(pop) = pop_w_pin.upgrade() {
+                let new_pinned = !pop.get_is_pinned();
+                pop.set_is_pinned(new_pinned);
+                info!("📌 Janela Popout Always-on-Top alterado para: {}", new_pinned);
+                #[cfg(target_os = "windows")]
+                if let Some(hwnd) = *pop_hwnd_pin.lock().unwrap() {
+                    unsafe {
+                        use windows_sys::Win32::UI::WindowsAndMessaging::{
+                            SetWindowPos, HWND_TOPMOST, HWND_NOTOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+                        };
+                        let insert_after = if new_pinned { HWND_TOPMOST } else { HWND_NOTOPMOST };
+                        SetWindowPos(hwnd as _, insert_after as _, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    set_linux_window_keep_above(new_pinned);
+                }
+                let _ = pop.window().with_winit_window(move |w| {
+                    w.set_window_level(if new_pinned {
+                        winit::window::WindowLevel::AlwaysOnTop
+                    } else {
+                        winit::window::WindowLevel::Normal
+                    });
+                });
+            }
+        });
+    }
+
+    let pop_w_drag = popout_weak.clone();
+    if let Some(pop_win) = popout_weak.upgrade() {
+        pop_win.on_start_window_drag(move || {
+            if let Some(pop) = pop_w_drag.upgrade() {
+                static LAST_POP_DRAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                let last = LAST_POP_DRAG.load(Ordering::Relaxed);
+                if now.saturating_sub(last) < 200 {
+                    return;
+                }
+                LAST_POP_DRAG.store(now, Ordering::Relaxed);
+
+                pop.set_drag_area_enabled(false);
+
+                let pop_weak_timer = pop.as_weak();
+                slint::Timer::single_shot(std::time::Duration::from_millis(150), move || {
+                    if let Some(pop_inst) = pop_weak_timer.upgrade() {
+                        pop_inst.set_drag_area_enabled(true);
+                    }
+                });
+
+                let _ = pop.window().with_winit_window(|winit_win| {
+                    let _ = winit_win.drag_window();
+                });
+            }
+        });
+    }
+
+    let pop_w_fs = popout_weak.clone();
+    if let Some(pop_win) = popout_weak.upgrade() {
+        pop_win.on_toggle_fullscreen(move || {
+            if let Some(pop) = pop_w_fs.upgrade() {
+                let current = pop.get_is_maximized();
+                let next = !current;
+                pop.set_is_maximized(next);
+                pop.window().set_maximized(next);
+            }
+        });
+    }
+
+    let pop_w_min = popout_weak.clone();
+    let pop_hwnd_min = Arc::clone(&popout_hwnd_store);
+    if let Some(pop_win) = popout_weak.upgrade() {
+        pop_win.on_minimize_popout(move || {
+            #[cfg(target_os = "windows")]
+            if let Some(hwnd) = *pop_hwnd_min.lock().unwrap() {
+                unsafe {
+                    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_MINIMIZE};
+                    ShowWindow(hwnd as _, SW_MINIMIZE);
+                }
+            }
+            if let Some(pop) = pop_w_min.upgrade() {
+                pop.window().set_minimized(true);
+            }
+        });
+    }
+
+    let pop_w_resize = popout_weak.clone();
+    if let Some(pop_win) = popout_weak.upgrade() {
+        pop_win.on_drag_resize(move |edge: slint::SharedString| {
+            if let Some(pop) = pop_w_resize.upgrade() {
+                static LAST_POP_RESIZE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                let last = LAST_POP_RESIZE.load(Ordering::Relaxed);
+                if now.saturating_sub(last) < 200 {
+                    return;
+                }
+                LAST_POP_RESIZE.store(now, Ordering::Relaxed);
+
+                pop.set_drag_area_enabled(false);
+
+                let pop_weak_timer = pop.as_weak();
+                slint::Timer::single_shot(std::time::Duration::from_millis(150), move || {
+                    if let Some(pop_inst) = pop_weak_timer.upgrade() {
+                        pop_inst.set_drag_area_enabled(true);
+                    }
+                });
+
+                let _ = pop.window().with_winit_window(move |winit_win| {
+                    let dir = match edge.as_str() {
+                        "top" => winit::window::ResizeDirection::North,
+                        "bottom" => winit::window::ResizeDirection::South,
+                        "left" => winit::window::ResizeDirection::West,
+                        "right" => winit::window::ResizeDirection::East,
+                        "top-left" => winit::window::ResizeDirection::NorthWest,
+                        "top-right" => winit::window::ResizeDirection::NorthEast,
+                        "bottom-left" => winit::window::ResizeDirection::SouthWest,
+                        "bottom-right" => winit::window::ResizeDirection::SouthEast,
+                        _ => return,
+                    };
+                    let _ = winit_win.drag_resize_window(dir);
+                });
+            }
+        });
+    }
+
+    // Intangible / Click-Through Ghost Mode Callbacks
+    let pop_w_ghost = popout_weak.clone();
+    let pop_hwnd_ghost = Arc::clone(&popout_hwnd_store);
+    let app_weak_ghost = app_weak.clone();
+
+    let toggle_ghost_fn = Arc::new(move || {
+        let mut new_state = false;
+        if let Some(pop) = pop_w_ghost.upgrade() {
+            new_state = !pop.get_is_intangible();
+            pop.set_is_intangible(new_state);
+            let hittest = !new_state;
+            let _ = pop.window().with_winit_window(move |w| {
+                let _ = w.set_cursor_hittest(hittest);
+            });
+            if new_state {
+                info!("👻 Modo Intangível ATIVADO no popup (cliques atravessam para os jogos/apps)!");
+            } else {
+                info!("🖱️ Modo Intangível DESATIVADO no popup (janela volta a receber cliques).");
+            }
+        }
+        if let Some(ui) = app_weak_ghost.upgrade() {
+            ui.set_is_popout_intangible(new_state);
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(hwnd) = *pop_hwnd_ghost.lock().unwrap() {
+            unsafe {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{
+                    GetWindowLongW, SetWindowLongW, GWL_EXSTYLE, WS_EX_LAYERED, WS_EX_TRANSPARENT,
+                };
+                let ex_style = GetWindowLongW(hwnd as _, GWL_EXSTYLE);
+                if new_state {
+                    SetWindowLongW(hwnd as _, GWL_EXSTYLE, ex_style | WS_EX_TRANSPARENT as i32 | WS_EX_LAYERED as i32);
+                } else {
+                    SetWindowLongW(hwnd as _, GWL_EXSTYLE, ex_style & !(WS_EX_TRANSPARENT as i32));
+                }
+            }
+        }
+    });
+
+    if let Some(pop_win) = popout_weak.upgrade() {
+        let tg1 = Arc::clone(&toggle_ghost_fn);
+        pop_win.on_toggle_intangible(move || {
+            tg1();
+        });
+    }
+
+    let tg2 = Arc::clone(&toggle_ghost_fn);
+    app.on_toggle_popout_intangible(move || {
+        tg2();
+    });
+
+    let pop_w_close = popout_weak.clone();
+    let pop_hwnd_close = Arc::clone(&popout_hwnd_store);
+    let app_weak_pop_close = app_weak.clone();
+    if let Some(pop_win) = popout_weak.upgrade() {
+        pop_win.on_close_popout(move || {
+            info!("📺 Fechando janela Popout e reanexando transmissão à sala principal!");
+            #[cfg(target_os = "windows")]
+            if let Some(hwnd) = *pop_hwnd_close.lock().unwrap() {
+                unsafe {
+                    use windows_sys::Win32::UI::WindowsAndMessaging::{
+                        ShowWindow, SW_HIDE, GetWindowLongW, SetWindowLongW, GWL_EXSTYLE, WS_EX_TRANSPARENT,
+                    };
+                    let ex_style = GetWindowLongW(hwnd as _, GWL_EXSTYLE);
+                    SetWindowLongW(hwnd as _, GWL_EXSTYLE, ex_style & !(WS_EX_TRANSPARENT as i32));
+                    ShowWindow(hwnd as _, SW_HIDE);
+                }
+            }
+            if let Some(pop) = pop_w_close.upgrade() {
+                pop.set_is_intangible(false);
+                let _ = pop.window().with_winit_window(|w| {
+                    let _ = w.set_cursor_hittest(true);
+                });
+                pop.set_user_id("".into());
+                let _ = pop.hide();
+            }
+            if let Some(ui) = app_weak_pop_close.upgrade() {
+                ui.set_is_popout_intangible(false);
+                ui.set_popped_out_stream_uid("".into());
+            }
+        });
+    }
+
+    let pop_w_mouse = popout_weak.clone();
+    let pop_autohide_mouse = std::rc::Rc::clone(&pop_autohide);
+    if let Some(pop_win) = popout_weak.upgrade() {
+        pop_win.on_mouse_activity(move || {
+            if let Some(pop) = pop_w_mouse.upgrade() {
+                if !pop.get_show_controls() {
+                    pop.set_show_controls(true);
+                }
+                pop_autohide_mouse.restart();
+            }
+        });
+
+        pop_win.on_stream_volume_changed(move |uid_str: slint::SharedString, vol: f32| {
+            let uid = uid_str.to_string().parse::<u64>().unwrap_or(0);
+            if uid != 0 {
+                screen_capture::set_stream_volume(uid, vol);
+            }
+        });
+    }
+
+    // Screen Share / Live Stream Video Callbacks (P2P UDP Transmitter & Receiver)
+    let screen_manager = Arc::new(ScreenCaptureManager::new());
+    let sm_clone = Arc::clone(&screen_manager);
+    let app_weak_ss = app_weak.clone();
+    let pop_w_ss = popout_weak.clone();
+    let pop_hwnd_ss = Arc::clone(&popout_hwnd_store);
+    let hidden_streams: Arc<std::sync::Mutex<std::collections::HashSet<String>>> = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+
+    // Thread-safe Latest Frame Stores for Zero-Backlog Slint Event Loop Rendering
+    let latest_rx_frame: Arc<Mutex<Option<(u64, String, String, SharedPixelBuffer<Rgba8Pixel>)>>> = Arc::new(Mutex::new(None));
+    let is_rx_ui_pending = Arc::new(AtomicBool::new(false));
+
+    let latest_tx_frame: Arc<Mutex<Option<SharedPixelBuffer<Rgba8Pixel>>>> = Arc::new(Mutex::new(None));
+    let is_tx_ui_pending = Arc::new(AtomicBool::new(false));
+
+    // Initialize P2P Video Receiver to receive streams from other users in real time!
+    let app_weak_rx = app_weak.clone();
+    let pop_w_rx = popout_weak.clone();
+    let hidden_streams_rx = Arc::clone(&hidden_streams);
+    let latest_rx_frame_cb = Arc::clone(&latest_rx_frame);
+    let is_rx_ui_pending_cb = Arc::clone(&is_rx_ui_pending);
+
+    screen_manager.start_receiver(
+        {
+            let app_w = app_weak_rx.clone();
+            let pop_w = pop_w_rx.clone();
+            move |uid, uname, quality, pixel_buf| {
+                *latest_rx_frame_cb.lock().unwrap() = Some((uid, uname, quality, pixel_buf));
+                if !is_rx_ui_pending_cb.swap(true, Ordering::AcqRel) {
+                    let app_w2 = app_w.clone();
+                    let pop_w2 = pop_w.clone();
+                    let latest_slot = Arc::clone(&latest_rx_frame_cb);
+                    let pending_flag = Arc::clone(&is_rx_ui_pending_cb);
+                    let pending_flag_inner = Arc::clone(&pending_flag);
+
+                    if let Err(_) = slint::invoke_from_event_loop(move || {
+                        pending_flag_inner.store(false, Ordering::Release);
+                        if let Some((uid, uname, quality, pixel_buf)) = latest_slot.lock().unwrap().take() {
+                            // The stop may have been handled while this frame was waiting
+                            // for the UI thread; showing it would re-open a dead stream.
+                            if screen_capture::is_stream_recently_stopped(uid) {
+                                return;
+                            }
+                            let uid_str = uid.to_string();
+                            let frame = Image::from_rgba8(pixel_buf);
+                            let rx_fps = screen_capture::get_rx_fps();
+                            let rx_fps_str = if rx_fps > 0.0 {
+                                format!("{:.1} FPS", rx_fps)
+                            } else {
+                                "".to_string()
+                            };
+                            // Next frames are converted at the largest size they are shown at.
+                            {
+                                let main_px = app_w2.upgrade().map(|ui| ui.window().size());
+                                let pop_px = pop_w2.upgrade().filter(|p| p.window().is_visible()).map(|p| p.window().size());
+                                let (mut vw, mut vh) = main_px.map(|s| (s.width, s.height)).unwrap_or((0, 0));
+                                if let Some(p) = pop_px {
+                                    vw = vw.max(p.width);
+                                    vh = vh.max(p.height);
+                                }
+                                screen_capture::set_stream_view_size(vw, vh);
+                            }
+                            let mut should_update_pop = false;
+                            if let Some(ui) = app_w2.upgrade() {
+                                let popped_uid = ui.get_popped_out_stream_uid().to_string();
+                                if popped_uid == uid_str {
+                                    should_update_pop = true;
+                                }
+                                ui.set_has_active_stream(true);
+                                ui.set_active_stream_user_id(uid_str.clone().into());
+                                ui.set_active_stream_user(uname.into());
+                                ui.set_tr_stream_quality(quality.into());
+                                ui.set_remote_stream_frame(frame.clone());
+                                ui.set_remote_stream_fps(rx_fps_str.clone().into());
+                                if let Some(pop) = pop_w2.upgrade() {
+                                    crate::ui::gpu_video::refresh(&ui, &pop);
+                                }
+
+                                // Garantir que o participante na lista de voz esteja marcado como streaming
+                                let cur_model = ui.get_voice_participants();
+                                for i in 0..cur_model.row_count() {
+                                    if let Some(mut p) = cur_model.row_data(i) {
+                                        if p.user_id == uid_str.as_str() && !p.is_streaming {
+                                            p.is_streaming = true;
+                                            cur_model.set_row_data(i, p);
+                                        }
+                                    }
+                                }
+                            }
+                            if should_update_pop {
+                                if let Some(pop) = pop_w2.upgrade() {
+                                    let pop_uid = pop.get_user_id().to_string();
+                                    if pop_uid == uid_str || pop_uid.is_empty() {
+                                        pop.set_stream_frame(frame);
+                                        pop.set_stream_fps(rx_fps_str.into());
+                                    }
+                                }
+                            }
+                        }
+                    }) {
+                        pending_flag.store(false, Ordering::Release);
+                    }
+                }
+            }
+        },
+        {
+            let app_w = app_weak_rx.clone();
+            let pop_w = pop_w_rx.clone();
+            let hidden_streams_rx_cb = Arc::clone(&hidden_streams_rx);
+            move |uid, is_streaming| {
+                let uid_str = uid.to_string();
+                let app_w2 = app_w.clone();
+                let pop_w2 = pop_w.clone();
+                let hidden_streams_inner = Arc::clone(&hidden_streams_rx_cb);
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = app_w2.upgrade() {
+                        if is_streaming {
+                            // Someone else's stream starts hidden, with a Watch button: nothing
+                            // is received until the user asks for it.
+                            let not_watching = uid != gateway::get_my_user_id() && !screen_capture::watch::is_wanted(uid);
+                            if not_watching {
+                                hidden_streams_inner.lock().unwrap().insert(uid_str.clone());
+                            }
+                            let cur_model = ui.get_voice_participants();
+                            for i in 0..cur_model.row_count() {
+                                if let Some(mut p) = cur_model.row_data(i) {
+                                    if p.user_id == uid_str.as_str() {
+                                        p.is_streaming = true;
+                                        if not_watching {
+                                            p.is_stream_hidden = true;
+                                        }
+                                        cur_model.set_row_data(i, p);
+                                    }
+                                }
+                            }
+                        } else {
+                            if uid == 0 {
+                                screen_capture::watch::clear_wanted();
+                            } else {
+                                screen_capture::watch::set_wanted(uid, false);
+                            }
+                            hidden_streams_inner.lock().unwrap().remove(uid_str.as_str());
+                            let cur_act_id = ui.get_active_stream_user_id().to_string();
+                            if cur_act_id == uid_str || cur_act_id.is_empty() || uid == 0 {
+                                ui.set_has_active_stream(false);
+                                ui.set_remote_stream_frame(Image::default());
+                                ui.set_active_stream_user("".into());
+                                ui.set_active_stream_user_id("".into());
+                                ui.set_tr_stream_quality("".into());
+                                ui.set_remote_stream_fps("".into());
+                            }
+                            if ui.get_popped_out_stream_uid() == uid_str.as_str() || uid == 0 {
+                                ui.set_popped_out_stream_uid("".into());
+                                if let Some(pop) = pop_w2.upgrade() {
+                                    pop.set_stream_frame(Image::default());
+                                    pop.set_user_id("".into());
+                                    let _ = pop.hide();
+                                }
+                            }
+                            if ui.get_focused_stream_uid() == uid_str.as_str() || uid == 0 {
+                                ui.set_focused_stream_uid("".into());
+                            }
+                            let cur_model = ui.get_voice_participants();
+                            for i in 0..cur_model.row_count() {
+                                if let Some(mut p) = cur_model.row_data(i) {
+                                    if p.user_id == uid_str.as_str() || uid == 0 {
+                                        p.is_streaming = false;
+                                        cur_model.set_row_data(i, p);
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(pop) = pop_w2.upgrade() {
+                            crate::ui::gpu_video::refresh(&ui, &pop);
+                        }
+                    }
+                });
+            }
+        }
+    );
+
+    app.on_toggle_screen_share(move || {
+        let sm = Arc::clone(&sm_clone);
+        if let Some(ui) = app_weak_ss.upgrade() {
+            let active = sm.is_active();
+            if active {
+                info!("🛑 Stopping P2P screen sharing...");
+                sm.stop();
+                ui.set_is_screen_sharing(false);
+                ui.set_web_share_active(false);
+                ui.set_web_share_url("".into());
+                ui.set_web_share_viewers(0);
+                ui.set_show_self_preview_notice(false);
+                ui.set_local_preview_fps("".into());
+                ui.set_active_stream_frame(Image::default());
+                let my_uid = gateway::get_my_user_id().to_string();
+                if ui.get_popped_out_stream_uid() == "self" || ui.get_popped_out_stream_uid() == my_uid.as_str() {
+                    ui.set_popped_out_stream_uid("".into());
+                    if let Some(pop) = pop_w_ss.upgrade() {
+                        pop.set_user_id("".into());
+                        pop.set_is_self(false);
+                        pop.set_show_self_preview_notice(false);
+                        let _ = pop.hide();
+                    }
+                }
+                if ui.get_focused_stream_uid() == "self" || ui.get_focused_stream_uid() == my_uid.as_str() {
+                    ui.set_focused_stream_uid("".into());
+                }
+                #[cfg(target_os = "windows")]
+                if let Some(hwnd) = *pop_hwnd_ss.lock().unwrap() {
+                    unsafe {
+                        use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+                        ShowWindow(hwnd as _, SW_HIDE);
+                    }
+                }
+            } else {
+                ui.set_active_stream_frame(Image::default());
+                let my_uid = gateway::get_my_user_id();
+                let my_uname = gateway::get_my_username();
+                let cid = gateway::get_my_voice_channel_id();
+                sm.set_context(cid, my_uid, &my_uname);
+
+                let res_str = ui.get_stream_selected_res().to_string();
+                let res_val: i32 = match res_str.as_str() {
+                    "1080p" => 1080,
+                    "480p" => 480,
+                    _ => 720,
+                };
+                let fps_val = ui.get_stream_selected_fps();
+                let target_fps: i32 = if fps_val <= 0 { 30 } else { fps_val };
+
+                let source_tab = ui.get_stream_source_tab().to_string();
+                let (target_hwnd, screen_index, camera_index, include_audio) = if source_tab == "cameras" {
+                    let cam_id_str = ui.get_stream_selected_camera_id().to_string();
+                    let cam_idx: Option<u32> = cam_id_str.parse().ok().or(Some(0));
+                    (0, 0, cam_idx, false)
+                } else if source_tab == "windows" {
+                    let hwnd: isize = ui.get_stream_selected_window_id().to_string().parse().unwrap_or(0);
+                    (hwnd, 0, None, ui.get_stream_include_audio())
+                } else {
+                    let screen_idx = ui.get_stream_selected_source_index().max(0) as usize;
+                    (0, screen_idx, None, ui.get_stream_include_audio())
+                };
+
+                #[cfg(target_os = "linux")]
+                screen_capture::reset_wayland_portal_cancelled();
+
+                info!("▶️ Starting P2P transmission (tab={}, screen_idx={}, {} @ {} FPS, hwnd={}, cam={:?}, audio={})...", source_tab, screen_index, res_str, target_fps, target_hwnd, camera_index, include_audio);
+                ui.set_tr_stream_quality(format!("{} {}fps", res_str, target_fps).into());
+
+                let app_weak_frame = app_weak_ss.clone();
+                let pop_w_frame = pop_w_ss.clone();
+                let latest_tx_frame_cb = Arc::clone(&latest_tx_frame);
+                let is_tx_ui_pending_cb = Arc::clone(&is_tx_ui_pending);
+
+                sm.start(target_hwnd, screen_index, camera_index, res_val, target_fps, include_audio, move |pixel_buffer| {
+                    *latest_tx_frame_cb.lock().unwrap() = Some(pixel_buffer);
+                    if !is_tx_ui_pending_cb.swap(true, Ordering::AcqRel) {
+                        let app_w = app_weak_frame.clone();
+                        let pop_w = pop_w_frame.clone();
+                        let latest_slot = Arc::clone(&latest_tx_frame_cb);
+                        let pending_flag = Arc::clone(&is_tx_ui_pending_cb);
+
+                        let _ = slint::invoke_from_event_loop(move || {
+                            pending_flag.store(false, Ordering::Release);
+                            if let Some(pixel_buf) = latest_slot.lock().unwrap().take() {
+                                let frame = Image::from_rgba8(pixel_buf);
+                                let tx_fps = screen_capture::get_tx_fps();
+                                let fps_str = if tx_fps > 0.0 {
+                                    format!("{:.1} FPS", tx_fps)
+                                } else {
+                                    format!("{} FPS", target_fps)
+                                };
+
+                                let mut is_pop_self = false;
+                                if let Some(ui) = app_w.upgrade() {
+                                    ui.set_active_stream_frame(frame.clone());
+                                    ui.set_local_preview_fps(fps_str.clone().into());
+                                    let popped = ui.get_popped_out_stream_uid().to_string();
+                                    let my_uid = gateway::get_my_user_id().to_string();
+                                    if popped == "self" || popped == my_uid {
+                                        is_pop_self = true;
+                                    }
+                                }
+                                if is_pop_self {
+                                    if let Some(pop) = pop_w.upgrade() {
+                                        pop.set_stream_frame(frame);
+                                        pop.set_stream_fps(fps_str.into());
+                                    }
+                                }
+                            }
+                        });
+                    }
+                });
+                ui.set_is_screen_sharing(true);
+                if video_settings::get_enable_self_preview_notice() {
+                    ui.set_show_self_preview_notice(true);
+                    let app_weak_notice = app_weak_ss.clone();
+                    slint::Timer::single_shot(std::time::Duration::from_secs(8), move || {
+                        if let Some(ui) = app_weak_notice.upgrade() {
+                            ui.set_show_self_preview_notice(false);
+                        }
+                    });
+                } else {
+                    ui.set_show_self_preview_notice(false);
+                }
+            }
+        }
+    });
+
+    // Updates arrive only when a viewer joins/leaves or the session changes.
+    let web_status_weak = app.as_weak();
+    screen_capture::web_share::on_status_change(move || {
+        let weak = web_status_weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                let active = ui.get_is_screen_sharing() && screen_capture::web_share::is_active();
+                ui.set_web_share_active(active);
+                ui.set_web_share_viewers(screen_capture::web_share::viewer_count() as i32);
+                if !active {
+                    ui.set_web_share_url("".into());
+                    ui.set_web_share_error(screen_capture::web_share::last_error().into());
+                }
+            }
+        });
+    });
+    let web_weak = app.as_weak();
+    let web_sm = Arc::clone(&screen_manager);
+    app.on_toggle_web_share(move || {
+        let Some(ui) = web_weak.upgrade() else { return; };
+        if ui.get_web_share_pending() { return; }
+        if screen_capture::web_share::is_active() {
+            screen_capture::web_share::stop();
+            ui.set_web_share_active(false);
+            ui.set_web_share_url("".into());
+            ui.set_web_share_viewers(0);
+            return;
+        }
+        if !web_sm.is_active() { return; }
+        ui.set_web_share_pending(true);
+        ui.set_web_share_error("".into());
+        ui.set_web_share_copied(false);
+        let weak = web_weak.clone();
+        let manager = Arc::clone(&web_sm);
+        std::thread::spawn(move || {
+            let result = screen_capture::web_share::start();
+            if !manager.is_active() { screen_capture::web_share::stop(); }
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_web_share_pending(false);
+                    match result {
+                        Ok(url) if manager.is_active() && screen_capture::web_share::is_active() => {
+                            ui.set_web_share_url(url.into());
+                            ui.set_web_share_active(true);
+                            ui.set_show_web_share_modal(true);
+                        },
+                        Err(e) => ui.set_web_share_error(e.to_string().into()),
+                        _ => {},
+                    }
+                }
+            });
+        });
+    });
+    let copy_web_weak = app.as_weak();
+    app.on_copy_web_share_link(move || {
+        if let Some(ui) = copy_web_weak.upgrade() {
+            let link = ui.get_web_share_url().to_string();
+            let copied = !link.is_empty() && copypasta::ClipboardContext::new()
+                .and_then(|mut ctx| copypasta::ClipboardProvider::set_contents(&mut ctx, link)).is_ok();
+            ui.set_web_share_copied(copied);
+        }
+    });
+
+    let app_weak_browser = app_weak.clone();
+    app.on_launch_stream_browser(move || {
+        info!("🌐 Abrindo navegador em modo de transmissão (sem travas DRM)...");
+        #[cfg(target_os = "windows")]
+        {
+            let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| "C:\\".to_string());
+            let profile_dir = format!("{}\\kiyora\\StreamBrowserProfile", local_app_data);
+            let _ = std::fs::create_dir_all(&profile_dir);
+
+            let candidates = [
+                "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+                "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+                "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+                "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+                "C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+            ];
+
+            let mut launched = false;
+            for exe in candidates {
+                if std::path::Path::new(exe).exists() {
+                    let res = std::process::Command::new(exe)
+                        .arg("--disable-gpu-compositing")
+                        .arg("--disable-direct-composition")
+                        .arg("--disable-features=HardwareProtectedVideo")
+                        .arg(format!("--user-data-dir={}", profile_dir))
+                        .arg("https://www.google.com")
+                        .spawn();
+                    if res.is_ok() {
+                        info!("🚀 Navegador para transmissão iniciado com sucesso via {}", exe);
+                        launched = true;
+                        break;
+                    }
+                }
+            }
+
+            if !launched {
+                let _ = std::process::Command::new("cmd")
+                    .args(&["/c", "start", "msedge", "--disable-gpu-compositing", "--disable-direct-composition", "--disable-features=HardwareProtectedVideo", &format!("--user-data-dir={}", profile_dir), "https://www.google.com"])
+                    .spawn();
+            }
+
+            let app_w = app_weak_browser.clone();
+            slint::Timer::single_shot(std::time::Duration::from_millis(1500), move || {
+                if let Some(ui) = app_w.upgrade() {
+                    let windows = screen_capture::list_capturable_windows();
+                    let first_win_id = windows.first().map(|w| w.id.clone()).unwrap_or_default();
+                    let ui_windows: Vec<WindowSourceItem> = windows.into_iter().map(|w| {
+                        let mut has_icon = false;
+                        let mut icon_image = Image::default();
+                        if let Some((iw, ih, rgba)) = w.icon_rgba {
+                            let mut pixel_buf = SharedPixelBuffer::<Rgba8Pixel>::new(iw, ih);
+                            pixel_buf.make_mut_bytes().copy_from_slice(&rgba);
+                            icon_image = Image::from_rgba8(pixel_buf);
+                            has_icon = true;
+                        }
+                        WindowSourceItem {
+                            id: w.id.into(),
+                            title: w.title.into(),
+                            app_name: w.app_name.into(),
+                            has_icon,
+                            icon_image,
+                        }
+                    }).collect();
+                    ui.set_available_windows(std::rc::Rc::new(slint::VecModel::from(ui_windows)).into());
+                    if !first_win_id.is_empty() {
+                        ui.set_stream_selected_window_id(first_win_id.into());
+                    }
+                }
+            });
+        }
+    });
+
+    let app_weak_modal = app_weak.clone();
+    app.on_open_stream_modal(move || {
+        if let Some(ui) = app_weak_modal.upgrade() {
+            let screens = screen_capture::list_screens();
+            let ui_screens: Vec<ScreenSourceItem> = screens.into_iter().map(|s| {
+                ScreenSourceItem {
+                    id: s.id,
+                    name: s.name.into(),
+                    resolution: s.resolution.into(),
+                    is_primary: s.is_primary,
+                }
+            }).collect();
+            ui.set_available_screens(std::rc::Rc::new(slint::VecModel::from(ui_screens)).into());
+
+            let windows = screen_capture::list_capturable_windows();
+            let first_win_id = windows.first().map(|w| w.id.clone()).unwrap_or_default();
+            let ui_windows: Vec<WindowSourceItem> = windows.into_iter().map(|w| {
+                let mut has_icon = false;
+                let mut icon_image = Image::default();
+                if let Some((iw, ih, rgba)) = w.icon_rgba {
+                    let mut pixel_buf = SharedPixelBuffer::<Rgba8Pixel>::new(iw, ih);
+                    pixel_buf.make_mut_bytes().copy_from_slice(&rgba);
+                    icon_image = Image::from_rgba8(pixel_buf);
+                    has_icon = true;
+                }
+                WindowSourceItem {
+                    id: w.id.into(),
+                    title: w.title.into(),
+                    app_name: w.app_name.into(),
+                    has_icon,
+                    icon_image,
+                }
+            }).collect();
+            ui.set_available_windows(std::rc::Rc::new(slint::VecModel::from(ui_windows)).into());
+
+            let cameras = screen_capture::list_cameras();
+            let first_cam_id = cameras.first().map(|c| c.id.clone()).unwrap_or_default();
+            let ui_cameras: Vec<CameraSourceItem> = cameras.into_iter().map(|c| {
+                CameraSourceItem {
+                    id: c.id.into(),
+                    name: c.name.into(),
+                }
+            }).collect();
+            ui.set_available_cameras(std::rc::Rc::new(slint::VecModel::from(ui_cameras)).into());
+
+            ui.set_stream_selected_source_index(0);
+            if ui.get_stream_source_tab() == "windows" {
+                ui.set_stream_selected_window_id(first_win_id.into());
+                ui.set_stream_include_audio(true);
+            } else if ui.get_stream_source_tab() == "cameras" {
+                ui.set_stream_selected_camera_id(first_cam_id.into());
+                ui.set_stream_include_audio(false);
+            } else {
+                ui.set_stream_selected_window_id("".into());
+                ui.set_stream_include_audio(true);
+            }
+            ui.set_show_stream_modal(true);
+        }
+    });
+
+    let app_weak_fs = app_weak.clone();
+    app.on_toggle_stream_fullscreen(move || {
+        if let Some(ui) = app_weak_fs.upgrade() {
+            let cur = ui.get_is_stream_fullscreen();
+            ui.set_is_stream_fullscreen(!cur);
+        }
+    });
+
+    let app_weak_focus_stream = app_weak.clone();
+    app.on_focus_stream(move |uid_str: SharedString| {
+        if let Some(ui) = app_weak_focus_stream.upgrade() {
+            let cur = ui.get_focused_stream_uid();
+            if cur == uid_str {
+                ui.set_focused_stream_uid("".into());
+            } else {
+                ui.set_focused_stream_uid(uid_str);
+            }
+        }
+    });
+
+    let app_weak_hide = app_weak.clone();
+    let hidden_streams_hide = Arc::clone(&hidden_streams);
+    app.on_hide_stream(move |uid_str: SharedString| {
+        let uid = uid_str.to_string();
+        info!("👁️ Ocultando stream de vídeo do usuário {}", uid);
+        hidden_streams_hide.lock().unwrap().insert(uid.clone());
+        // Hiding someone's stream stops receiving it (the sender stops sending to us).
+        screen_capture::watch::set_wanted(uid.parse().unwrap_or(0), false);
+        if let Some(ui) = app_weak_hide.upgrade() {
+            if ui.get_focused_stream_uid() == uid.as_str() {
+                ui.set_focused_stream_uid("".into());
+            }
+            let cur_model = ui.get_voice_participants();
+            for i in 0..cur_model.row_count() {
+                if let Some(mut p) = cur_model.row_data(i) {
+                    if p.user_id == uid_str {
+                        p.is_stream_hidden = true;
+                        cur_model.set_row_data(i, p);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let app_weak_unhide = app_weak.clone();
+    let hidden_streams_unhide = Arc::clone(&hidden_streams);
+    let pop_w_unhide = popout_weak.clone();
+    let pop_hwnd_unhide = Arc::clone(&popout_hwnd_store);
+    app.on_unhide_stream(move |uid_str: SharedString| {
+        let uid = uid_str.to_string();
+        info!("👁️ Reexibindo stream de vídeo do usuário {}", uid);
+        hidden_streams_unhide.lock().unwrap().remove(uid.as_str());
+        // Watch: ask the sender for the stream.
+        screen_capture::watch::set_wanted(uid.parse().unwrap_or(0), true);
+        if let Some(ui) = app_weak_unhide.upgrade() {
+            if ui.get_popped_out_stream_uid() == uid.as_str() {
+                ui.set_popped_out_stream_uid("".into());
+                ui.set_is_popout_intangible(false);
+                if let Some(pop) = pop_w_unhide.upgrade() {
+                    pop.set_is_intangible(false);
+                    let _ = pop.window().with_winit_window(|w| {
+                        let _ = w.set_cursor_hittest(true);
+                    });
+                    pop.set_user_id("".into());
+                    let _ = pop.hide();
+                }
+                #[cfg(target_os = "windows")]
+                if let Some(hwnd) = *pop_hwnd_unhide.lock().unwrap() {
+                    unsafe {
+                        use windows_sys::Win32::UI::WindowsAndMessaging::{
+                            ShowWindow, SW_HIDE, GetWindowLongW, SetWindowLongW, GWL_EXSTYLE, WS_EX_TRANSPARENT,
+                        };
+                        let ex_style = GetWindowLongW(hwnd as _, GWL_EXSTYLE);
+                        SetWindowLongW(hwnd as _, GWL_EXSTYLE, ex_style & !(WS_EX_TRANSPARENT as i32));
+                        ShowWindow(hwnd as _, SW_HIDE);
+                    }
+                }
+            }
+            let cur_model = ui.get_voice_participants();
+            for i in 0..cur_model.row_count() {
+                if let Some(mut p) = cur_model.row_data(i) {
+                    if p.user_id == uid_str {
+                        p.is_stream_hidden = false;
+                        cur_model.set_row_data(i, p);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let app_weak_mute = app_weak.clone();
+    app.on_toggle_user_mute(move |uid_str: SharedString| {
+        let uid = uid_str.to_string();
+        let (is_m, _vol) = gateway::get_user_mute_volume(&uid);
+        let new_m = !is_m;
+        gateway::set_user_mute(&uid, new_m);
+        info!("🎙️ Mute do participante {} alterado para: {}", uid, new_m);
+        if let Some(ui) = app_weak_mute.upgrade() {
+            let cur_model = ui.get_voice_participants();
+            for i in 0..cur_model.row_count() {
+                if let Some(mut p) = cur_model.row_data(i) {
+                    if p.user_id == uid_str {
+                        p.is_muted = new_m;
+                        cur_model.set_row_data(i, p);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let app_weak_vol = app_weak.clone();
+    app.on_set_user_volume(move |uid_str: SharedString, vol: f32| {
+        let uid = uid_str.to_string();
+        gateway::set_user_volume(&uid, vol);
+        if let Some(ui) = app_weak_vol.upgrade() {
+            let cur_model = ui.get_voice_participants();
+            for i in 0..cur_model.row_count() {
+                if let Some(mut p) = cur_model.row_data(i) {
+                    if p.user_id == uid_str {
+                        p.volume = vol;
+                        cur_model.set_row_data(i, p);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let app_weak_stream_vol = app_weak.clone();
+    app.on_set_stream_volume(move |uid_str: SharedString, vol: f32| {
+        let uid = uid_str.to_string().parse::<u64>().unwrap_or(0);
+        if uid != 0 {
+            screen_capture::set_stream_volume(uid, vol);
+        }
+        if let Some(ui) = app_weak_stream_vol.upgrade() {
+            ui.set_stream_remote_volume(vol);
+        }
+    });
+
+    let app_weak_prio = app_weak.clone();
+    app.on_set_user_priority(move |uid_str: SharedString, prio: i32| {
+        let uid = uid_str.to_string();
+        info!("👑 Prioridade de fala do participante {} alterada para: P:{}", uid, prio);
+        gateway::set_user_priority(&uid, prio);
+        if let Some(ui) = app_weak_prio.upgrade() {
+            let cur_model = ui.get_voice_participants();
+            for i in 0..cur_model.row_count() {
+                if let Some(mut p) = cur_model.row_data(i) {
+                    if p.user_id == uid_str {
+                        p.priority = prio;
+                        cur_model.set_row_data(i, p);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // Dispatch Live Voice Room Participants & Animated Volume Level Bars
+    let app_weak_voice_loop = app_weak.clone();
+    let http_client_voice_loop = Arc::clone(&http_client);
+    let active_guild_voice_loop = Arc::clone(&active_guild_id);
+    let hidden_streams_voice_loop = Arc::clone(&hidden_streams);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_panel_fingerprint: Vec<(u32, u64, u8)> = Vec::new();
+        let mut last_panel_update = std::time::Instant::now();
+        loop {
+            interval.tick().await;
+
+            // Nothing to draw while hidden or outside a call: sleep until the window
+            // comes back or voice connects (created before the check so no wake is lost).
+            let woken = UI_LOOPS_WAKE.notified();
+            if !APP_IS_VISIBLE.load(Ordering::Relaxed) || !gateway::is_connected_to_voice() {
+                woken.await;
+                continue;
+            }
+
+            // Participants and audio levels are read here, off the UI thread (try_lock: never
+            // wait on the audio callback's locks).
+            let my_uid = gateway::get_my_user_id();
+            let self_level = gateway::get_self_mic_level();
+            let mut parts_snapshot: Vec<(u32, u64)> = match gateway::get_active_voice_participants_store().try_lock() {
+                Ok(map) => map.iter().filter(|(&s, _)| s != 999999).map(|(&s, &u)| (s, u)).collect(),
+                Err(_) => continue, // Skip this tick; the audio thread holds the lock
+            };
+            parts_snapshot.sort_unstable();
+            let mut ssrc_levels: HashMap<u32, f32> = HashMap::new();
+            if let Ok(queues) = gateway::get_speaker_pcm_queues().try_lock() {
+                for &(ssrc, user_id) in &parts_snapshot {
+                    if user_id == my_uid && my_uid > 0 { continue; }
+                    if let Some(q) = queues.get(&ssrc) {
+                        let sample_cnt = q.len().min(480);
+                        if sample_cnt > 0 {
+                            let sum_sq: f32 = q.iter().take(sample_cnt).map(|&(l, r)| { let s = (l + r) * 0.5; s * s }).sum();
+                            let rms = (sum_sq / sample_cnt as f32).sqrt();
+                            ssrc_levels.insert(ssrc, if rms < 0.005 { 0.0 } else { (rms * 3.5).clamp(0.0, 1.0) });
+                        }
+                    }
+                }
+            }
+
+            // Only wake the UI when what it shows can have changed: who is here and the level
+            // bars (in steps of 5%). In a quiet call this drops the UI updates from 10/s to
+            // the 1/s refresh that also picks up anything not covered here (names, mute...).
+            let mut fingerprint: Vec<(u32, u64, u8)> = parts_snapshot
+                .iter()
+                .map(|&(ssrc, uid)| (ssrc, uid, (ssrc_levels.get(&ssrc).copied().unwrap_or(0.0) * 20.0) as u8))
+                .collect();
+            // Our own bar only shows above the voice threshold; mic noise below it changes nothing.
+            let shown_self_level = if self_level >= gateway::get_vad_threshold() { self_level } else { 0.0 };
+            fingerprint.push((0, 0, (shown_self_level * 20.0) as u8));
+            if fingerprint == last_panel_fingerprint && last_panel_update.elapsed() < std::time::Duration::from_secs(1) {
+                continue;
+            }
+            last_panel_fingerprint = fingerprint;
+            last_panel_update = std::time::Instant::now();
+
+            let app_w_inner = app_weak_voice_loop.clone();
+            let http_client_voice_loop_inner = Arc::clone(&http_client_voice_loop);
+            let active_guild_voice_loop_inner = Arc::clone(&active_guild_voice_loop);
+            let hidden_streams_voice_loop_inner = Arc::clone(&hidden_streams_voice_loop);
+
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = app_w_inner.upgrade() else { return; };
+                if !ui.get_is_in_voice() { return; }
+
+                if ui.get_is_voice_connecting() {
+                    ui.set_is_voice_connecting(false);
+                }
+
+                let mut participants = Vec::new();
+
+                let mut user_best: HashMap<u64, (u32, f32, bool)> = HashMap::new();
+                for (ssrc, user_id) in parts_snapshot {
+                    if user_id == 999999 { continue; }
+                    let (audio_level, is_speaking) = if user_id == my_uid && my_uid > 0 {
+                        (self_level, self_level > 0.03)
+                    } else {
+                        let lvl = ssrc_levels.get(&ssrc).copied().unwrap_or(0.0);
+                        (lvl, lvl > 0.03)
+                    };
+                    let entry = user_best.entry(user_id).or_insert((ssrc, audio_level, is_speaking));
+                    if audio_level > entry.1 { *entry = (ssrc, audio_level, is_speaking); }
+                }
+
+                let my_user_id = gateway::get_my_user_id();
+                let mut sorted_users: Vec<_> = user_best.into_iter().collect();
+                sorted_users.sort_by(|(id_a, _), (id_b, _)| {
+                    let is_self_a = (*id_a == my_user_id && my_user_id != 0) || *id_a == 999999;
+                    let is_self_b = (*id_b == my_user_id && my_user_id != 0) || *id_b == 999999;
+                    if is_self_a && !is_self_b {
+                        std::cmp::Ordering::Less
+                    } else if !is_self_a && is_self_b {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        let name_a = gateway::get_user_name(*id_a);
+                        let name_b = gateway::get_user_name(*id_b);
+                        name_a.cmp(&name_b)
+                    }
+                });
+
+                let _total_users_count = sorted_users.len();
+                // Reuse the thumbnails already attached to the current rows so the
+                // 20 Hz refresh never re-copies pixels from the cache.
+                let prev_model = ui.get_voice_participants();
+                let mut prev_avatars: HashMap<String, (String, slint::Image)> = HashMap::new();
+                for i in 0..prev_model.row_count() {
+                    if let Some(row) = prev_model.row_data(i) {
+                        if row.avatar_img.size().width > 0 {
+                            prev_avatars.insert(row.user_id.to_string(), (row.avatar_url.to_string(), row.avatar_img));
+                        }
+                    }
+                }
+                let avatars = avatar_cache::get_avatar_cache();
+                for (user_id, (_ssrc, audio_level, is_speaking)) in sorted_users {
+                    let uid_str = user_id.to_string();
+                    let is_self = (user_id == my_user_id && my_user_id != 0) || user_id == 999999;
+
+                    let username = if is_self {
+                        let resolved = if my_user_id != 0 { gateway::get_user_name(my_user_id) } else { String::new() };
+                        if resolved.is_empty() || resolved.starts_with("Participante #") {
+                            "Você".to_string()
+                        } else {
+                            resolved
+                        }
+                    } else {
+                        let uname = gateway::get_user_name(user_id);
+                        if uname.starts_with("Participante #") {
+                            if let Ok(http_opt) = http_client_voice_loop_inner.try_lock() {
+                                if let Some(http) = http_opt.clone() {
+                                    static FETCHING_USERS: std::sync::OnceLock<Arc<Mutex<std::collections::HashSet<u64>>>> = std::sync::OnceLock::new();
+                                    let fetching_store = FETCHING_USERS.get_or_init(|| Arc::new(Mutex::new(std::collections::HashSet::new())));
+                                    if let Ok(mut set) = fetching_store.try_lock() {
+                                        if set.insert(user_id) {
+                                            let uid_str_task = uid_str.clone();
+                                            let active_gid = match active_guild_voice_loop_inner.try_lock() {
+                                                Ok(g) => g.clone(),
+                                                Err(_) => String::new(),
+                                            };
+                                            let store_arc = Arc::clone(fetching_store);
+                                            tokio::spawn(async move {
+                                                let mut resolved_name = String::new();
+
+                                                // 1. Try GET /guilds/{guild_id}/members/{user_id} first (returns nick, user object)
+                                                if !active_gid.is_empty() {
+                                                    if let Ok(member_json) = http.get_guild_member(&active_gid, &uid_str_task).await {
+                                                        if let Some(nick) = member_json["nick"].as_str() {
+                                                            if !nick.is_empty() { resolved_name = nick.to_string(); }
+                                                        }
+                                                        if resolved_name.is_empty() {
+                                                            if let Some(gname) = member_json["user"]["global_name"].as_str() {
+                                                                if !gname.is_empty() { resolved_name = gname.to_string(); }
+                                                            }
+                                                        }
+                                                        if resolved_name.is_empty() {
+                                                            if let Some(uname) = member_json["user"]["username"].as_str() {
+                                                                if !uname.is_empty() { resolved_name = uname.to_string(); }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                                // 2. Fallback to GET /users/{user_id}
+                                                if resolved_name.is_empty() {
+                                                    if let Ok(profile) = http.get_user_profile(&uid_str_task).await {
+                                                        resolved_name = profile["global_name"].as_str()
+                                                            .or_else(|| profile["username"].as_str())
+                                                            .unwrap_or("")
+                                                            .to_string();
+                                                    }
+                                                }
+
+                                                if !resolved_name.is_empty() {
+                                                    gateway::register_user_name(user_id, resolved_name.clone());
+                                                    info!("✅ Nome de usuário/bot resolvido via REST API: {} -> {}", user_id, resolved_name);
+                                                } else {
+                                                    if let Ok(mut set) = store_arc.lock() {
+                                                        set.remove(&user_id);
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        uname
+                    };
+
+                    let avatar_text = username.chars().next().unwrap_or('U').to_uppercase().to_string();
+                    let (is_muted_saved, vol, prio) = gateway::get_user_audio_settings(&uid_str);
+
+                    let (final_audio_level, final_is_speaking, final_is_muted) = if is_self {
+                        let mic_lvl = self_level;
+                        let is_self_muted = ui.get_is_muted();
+                        if is_self_muted {
+                            (0.0, false, true)
+                        } else {
+                            let is_spk = mic_lvl >= gateway::get_vad_threshold();
+                            let lvl = if is_spk { mic_lvl } else { 0.0 };
+                            (lvl, is_spk, false)
+                        }
+                    } else {
+                        (audio_level, is_speaking, is_muted_saved)
+                    };
+
+                    let is_streaming_peer = if is_self {
+                        if ui.get_is_screen_sharing() {
+                            true
+                        } else {
+                            let act_uid = ui.get_active_stream_user_id();
+                            let act_uname = ui.get_active_stream_user();
+                            ui.get_has_active_stream() && (
+                                (!act_uid.is_empty() && act_uid.as_str() == uid_str.as_str())
+                                || (!act_uname.is_empty() && act_uname.as_str() == username.as_str())
+                            )
+                        }
+                    } else {
+                        let act_uid = ui.get_active_stream_user_id();
+                        let act_uname = ui.get_active_stream_user();
+                        // Streams arrive only once watched: the sender's own announcement is
+                        // what shows the LIVE badge and the Watch button before that.
+                        screen_capture::peer_is_streaming(user_id) || (ui.get_has_active_stream() && (
+                            (!act_uid.is_empty() && act_uid.as_str() == uid_str.as_str())
+                            || (!act_uname.is_empty() && act_uname.as_str() == username.as_str())
+                        ))
+                    };
+
+                    let is_hidden = hidden_streams_voice_loop_inner.lock().map(|h| h.contains(&uid_str)).unwrap_or(false);
+
+                    let avatar_user_id = if user_id == 999999 { my_user_id } else { user_id };
+                    let avatar_url = gateway::get_user_avatar_url(avatar_user_id);
+                    let avatar_img = match prev_avatars.get(&uid_str) {
+                        Some((url, image)) if *url == avatar_url => image.clone(),
+                        _ => avatars.image_for(&avatar_url),
+                    };
+
+                    participants.push(VoiceParticipant {
+                        user_id: uid_str.into(),
+                        username: username.into(),
+                        avatar_text: avatar_text.into(),
+                        avatar_url: avatar_url.into(),
+                        avatar_img,
+                        is_speaking: final_is_speaking,
+                        audio_level: final_audio_level,
+                        is_muted: final_is_muted,
+                        volume: vol,
+                        priority: prio,
+                        is_self,
+                        is_streaming: is_streaming_peer,
+                        is_stream_hidden: is_hidden,
+                    });
+                }
+
+                let cur_model = ui.get_voice_participants();
+                let mut need_full_rebuild = cur_model.row_count() != participants.len();
+                if !need_full_rebuild {
+                    for (i, p) in participants.iter().enumerate() {
+                        if let Some(old) = cur_model.row_data(i) {
+                            if old.user_id != p.user_id || old.username != p.username || old.priority != p.priority || old.is_self != p.is_self {
+                                need_full_rebuild = true;
+                                break;
+                            }
+                        } else {
+                            need_full_rebuild = true;
+                            break;
+                        }
+                    }
+                }
+
+                if need_full_rebuild {
+                    let model = std::rc::Rc::new(slint::VecModel::from(participants));
+                    ui.set_voice_participants(model.into());
+                } else {
+                    for (i, p) in participants.into_iter().enumerate() {
+                        if let Some(old) = cur_model.row_data(i) {
+                            let level_diff = (old.audio_level - p.audio_level).abs();
+                            let both_zero = old.audio_level < 0.01 && p.audio_level < 0.01;
+                            let level_changed = !both_zero && level_diff >= 0.03;
+                            let state_changed = old.is_speaking != p.is_speaking
+                                || old.is_muted != p.is_muted
+                                || old.volume != p.volume
+                                || old.priority != p.priority
+                                || old.username != p.username
+                                || old.avatar_url != p.avatar_url
+                                || old.is_streaming != p.is_streaming
+                                || old.is_stream_hidden != p.is_stream_hidden;
+                            if level_changed || state_changed {
+                                cur_model.set_row_data(i, p);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    // Brings the UI up to date when the window comes back from the tray. While hidden,
+    // gateway events only record what changed: messages of the open channel are refetched,
+    // and voice counts, unread counts and DM order are applied in one go.
+    let app_weak_restore = app_weak.clone();
+    let http_client_restore = Arc::clone(&http_client);
+    let active_channel_restore = Arc::clone(&active_channel_id);
+    let active_guild_restore = Arc::clone(&active_guild_id);
+    let guilds_map_restore = Arc::clone(&guilds_map);
+    tokio::spawn(async move {
+        loop {
+            let woken = UI_LOOPS_WAKE.notified();
+            if APP_IS_VISIBLE.load(Ordering::Relaxed)
+                && NEED_UI_REFRESH.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+            {
+                let pending = PENDING_MESSAGES.swap(0, Ordering::Relaxed);
+                let ch_id = active_channel_restore.lock().unwrap().clone();
+                let http_opt = http_client_restore.lock().unwrap().clone();
+                if let (false, Some(http)) = (ch_id.is_empty(), http_opt) {
+                    info!("[DeepSleep] Restaurado - re-sincronizando {} mensagem(s) pendente(s) do canal {}.", pending, ch_id);
+                    let app_w = app_weak_restore.clone();
+                    let ch = ch_id.clone();
+                    tokio::spawn(async move {
+                        load_messages_for_channel(&http, app_w, &ch).await;
+                    });
+                }
+
+                let gid = active_guild_restore.lock().unwrap().clone();
+                let fresh_channels = if crate::ui::helpers::VOICE_STATES_DIRTY.swap(false, Ordering::Relaxed) {
+                    let chans = guilds_map_restore.lock().ok().and_then(|m| m.get(&gid).map(|g| g.channels.clone()));
+                    chans.map(|c| {
+                        let cats = get_collapsed_categories().lock().unwrap().clone();
+                        build_ui_channels(&c, &cats)
+                    })
+                } else {
+                    None
+                };
+                let activity = crate::ui::helpers::take_hidden_channel_activity();
+                let dm_total = crate::ui::helpers::get_total_dm_unreads();
+                let app_w = app_weak_restore.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = app_w.upgrade() {
+                        ui.set_total_dm_unread_count(dm_total);
+                        if let Some(rows) = fresh_channels {
+                            crate::ui::helpers::update_channel_voice_rows(&ui, rows);
+                        }
+                        crate::ui::helpers::apply_channel_activity(&ui, &activity, &ch_id, gid == "@me");
+                    }
+                });
+            }
+            woken.await;
+        }
+    });
+
+    // Periodic update for voice channel participant badges in sidebar (fingerprinted delta check)
+    let app_weak_ch_badges = app_weak.clone();
+    let guilds_map_badges = Arc::clone(&guilds_map);
+    let active_guild_badges = Arc::clone(&active_guild_id);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(1500));
+        let mut last_fingerprint: Vec<(String, Vec<(u64, String)>)> = Vec::new();
+        let mut last_gid = String::new();
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let woken = UI_LOOPS_WAKE.notified();
+            if !APP_IS_VISIBLE.load(Ordering::Relaxed) {
+                woken.await;
+                continue;
+            }
+            let gid = active_guild_badges.lock().unwrap().clone();
+            if gid.is_empty() { continue; }
+
+            let channels_opt = {
+                if let Ok(map) = guilds_map_badges.lock() {
+                    map.get(&gid).map(|g| g.channels.clone())
+                } else {
+                    None
+                }
+            };
+
+            if let Some(chans) = channels_opt {
+                let mut current_fingerprint = Vec::with_capacity(chans.len());
+                for ch in &chans {
+                    let participants = if ch.is_voice {
+                        gateway::get_voice_channel_participants(&ch.id)
+                    } else {
+                        Vec::new()
+                    };
+                    current_fingerprint.push((ch.id.clone(), participants));
+                }
+
+                let guild_changed = gid != last_gid;
+                if guild_changed || current_fingerprint != last_fingerprint {
+                    last_gid = gid;
+                    last_fingerprint = current_fingerprint;
+
+                    let ui_channels = {
+                        let cats_guard = get_collapsed_categories().lock().unwrap().clone();
+                        build_ui_channels(&chans, &cats_guard)
+                    };
+
+                    let app_w = app_weak_ch_badges.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = app_w.upgrade() {
+                            let cur_chans = ui.get_channels();
+                            let mut needs_rebuild = cur_chans.row_count() != ui_channels.len();
+                            if !needs_rebuild {
+                                for (i, new_c) in ui_channels.iter().enumerate() {
+                                    if let Some(old_c) = cur_chans.row_data(i) {
+                                        if old_c.voice_count != new_c.voice_count
+                                            || old_c.name != new_c.name
+                                            || old_c.id != new_c.id
+                                        {
+                                            cur_chans.set_row_data(i, new_c.clone());
+                                        }
+                                    } else {
+                                        needs_rebuild = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if needs_rebuild {
+                                let model = std::rc::Rc::new(slint::VecModel::from(ui_channels));
+                                ui.set_channels(model.into());
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    // Voice & Audio Settings Callbacks
+    let app_weak_open_settings = app_weak.clone();
+    let selected_input_open = Arc::clone(&selected_input);
+    let selected_output_open = Arc::clone(&selected_output);
+    let level_tx_open = level_tx.clone();
+    let active_stream_open = Arc::clone(&active_mic_stream);
+
+    app.on_open_settings(move || {
+        MIC_METER_VISIBLE.store(true, Ordering::Relaxed);
+        if let Some(ui) = app_weak_open_settings.upgrade() {
+            // 1. Instantly display modal without blocking GUI thread!
+            ui.set_show_settings_modal(true);
+            ui.set_vad_threshold(gateway::get_vad_threshold());
+            ui.set_mic_volume(gateway::get_mic_volume());
+            ui.set_is_testing_mic(gateway::is_testing_mic());
+
+            let current_lang = i18n::load_persisted_language_config();
+            let lang_items: Vec<LanguageItem> = i18n::Language::all_available().iter().map(|&l| {
+                let (display, native) = l.display_info();
+                LanguageItem {
+                    code: l.code().into(),
+                    name: display.into(),
+                    native_name: native.into(),
+                    is_selected: l == current_lang,
+                }
+            }).collect();
+            ui.set_languages(std::rc::Rc::new(slint::VecModel::from(lang_items)).into());
+            populate_video_interface_settings(&ui);
+            populate_voice_processing_settings(&ui);
+            populate_network_proxy_settings(&ui);
+
+            // 2. Populate devices immediately from cache if available
+            let cur_input = selected_input_open.lock().unwrap().clone();
+            let cur_output = selected_output_open.lock().unwrap().clone();
+
+            let cached = get_audio_devices_cache().lock().unwrap().clone();
+            if let Some((cached_inputs, cached_outputs)) = cached {
+                let ui_inputs: Vec<AudioDeviceItem> = cached_inputs.iter().enumerate().map(|(idx, name)| {
+                    let is_sel = if cur_input.is_empty() { idx == 0 } else { name == &cur_input };
+                    AudioDeviceItem {
+                        id: name.clone().into(),
+                        name: name.clone().into(),
+                        is_selected: is_sel,
+                    }
+                }).collect();
+
+                let ui_outputs: Vec<AudioDeviceItem> = cached_outputs.iter().enumerate().map(|(idx, name)| {
+                    let is_sel = if cur_output.is_empty() { idx == 0 } else { name == &cur_output };
+                    AudioDeviceItem {
+                        id: name.clone().into(),
+                        name: name.clone().into(),
+                        is_selected: is_sel,
+                    }
+                }).collect();
+
+                ui.set_input_devices(std::rc::Rc::new(slint::VecModel::from(ui_inputs)).into());
+                ui.set_output_devices(std::rc::Rc::new(slint::VecModel::from(ui_outputs)).into());
+            }
+
+            // 3. Start mic capture for volume meter
+            let mic_name = cur_input.clone();
+            *active_stream_open.lock().unwrap() = Some(start_mic_capture(mic_name, level_tx_open.clone()));
+
+            // 4. Asynchronously refresh hardware devices in background without lag
+            let app_w_async = app_weak_open_settings.clone();
+            let sel_in = selected_input_open.clone();
+            let sel_out = selected_output_open.clone();
+            tokio::task::spawn_blocking(move || {
+                let (inputs, outputs) = enumerate_audio_devices();
+                let cur_in = sel_in.lock().unwrap().clone();
+                let cur_out = sel_out.lock().unwrap().clone();
+
+                let ui_inputs: Vec<AudioDeviceItem> = inputs.iter().enumerate().map(|(idx, name)| {
+                    let is_sel = if cur_in.is_empty() { idx == 0 } else { name == &cur_in };
+                    AudioDeviceItem {
+                        id: name.clone().into(),
+                        name: name.clone().into(),
+                        is_selected: is_sel,
+                    }
+                }).collect();
+
+                let ui_outputs: Vec<AudioDeviceItem> = outputs.iter().enumerate().map(|(idx, name)| {
+                    let is_sel = if cur_out.is_empty() { idx == 0 } else { name == &cur_out };
+                    AudioDeviceItem {
+                        id: name.clone().into(),
+                        name: name.clone().into(),
+                        is_selected: is_sel,
+                    }
+                }).collect();
+
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui_inner) = app_w_async.upgrade() {
+                        ui_inner.set_input_devices(std::rc::Rc::new(slint::VecModel::from(ui_inputs)).into());
+                        ui_inner.set_output_devices(std::rc::Rc::new(slint::VecModel::from(ui_outputs)).into());
+                    }
+                });
+            });
+        }
+    });
+
+    let app_weak_close_settings = app_weak.clone();
+    let active_stream_close = Arc::clone(&active_mic_stream);
+    let active_loopback_close = Arc::clone(&active_loopback_stream);
+    app.on_close_settings(move || {
+        MIC_METER_VISIBLE.store(false, Ordering::Relaxed);
+        if let Some(ui) = app_weak_close_settings.upgrade() {
+            ui.set_show_settings_modal(false);
+            gateway::set_testing_mic(false);
+            ui.set_is_testing_mic(false);
+            *active_loopback_close.lock().unwrap() = None;
+            if let Ok(mut q) = gateway::get_mic_loopback_queue().lock() {
+                q.clear();
+            }
+            if !ui.get_is_in_voice() {
+                *active_stream_close.lock().unwrap() = None; // Only stop test stream if not in voice
+            }
+        }
+    });
+
+    let app_weak_select_input = app_weak.clone();
+    let selected_input_store = Arc::clone(&selected_input);
+    let level_tx_select = level_tx.clone();
+    let active_stream_select = Arc::clone(&active_mic_stream);
+
+    app.on_select_input_device(move |dev_name: SharedString| {
+        let name_str = dev_name.to_string();
+        info!("Microfone selecionado: {}", name_str);
+        *selected_input_store.lock().unwrap() = name_str.clone();
+        gateway::set_persisted_input_device(name_str.clone());
+
+        if let Some(ui) = app_weak_select_input.upgrade() {
+            let current_devs: Vec<AudioDeviceItem> = ui.get_input_devices().iter().map(|mut item| {
+                item.is_selected = item.name.as_str() == name_str;
+                item
+            }).collect();
+            ui.set_input_devices(std::rc::Rc::new(slint::VecModel::from(current_devs)).into());
+            ui.set_selected_input_device(name_str.clone().into());
+
+            // Restart hardware microphone stream for newly selected device
+            *active_stream_select.lock().unwrap() = Some(start_mic_capture(name_str, level_tx_select.clone()));
+        }
+    });
+
+    let app_weak_select_output = app_weak.clone();
+    let selected_output_store = Arc::clone(&selected_output);
+    let active_loopback_output = Arc::clone(&active_loopback_stream);
+    app.on_select_output_device(move |dev_name: SharedString| {
+        let name_str = dev_name.to_string();
+        info!("Alto-falante selecionado: {}", name_str);
+        *selected_output_store.lock().unwrap() = name_str.clone();
+        gateway::set_persisted_output_device(name_str.clone());
+
+        if let Some(ui) = app_weak_select_output.upgrade() {
+            let current_devs: Vec<AudioDeviceItem> = ui.get_output_devices().iter().map(|mut item| {
+                item.is_selected = item.name.as_str() == name_str;
+                item
+            }).collect();
+            ui.set_output_devices(std::rc::Rc::new(slint::VecModel::from(current_devs)).into());
+            ui.set_selected_output_device(name_str.clone().into());
+
+            // If mic testing ("se ouvir") is active, restart output loopback stream for new device
+            if gateway::is_testing_mic() {
+                if let Some(stream) = start_mic_loopback_stream(name_str) {
+                    *active_loopback_output.lock().unwrap() = Some(stream);
+                }
+            }
+        }
+    });
+
+    app.on_set_vad_threshold(move |threshold: f32| {
+        gateway::set_vad_threshold(threshold);
+    });
+
+    app.on_set_mic_volume(move |vol: f32| {
+        gateway::set_mic_volume(vol);
+    });
+
+    let app_weak_test_mic = app_weak.clone();
+    let selected_output_test = Arc::clone(&selected_output);
+    let selected_input_test = Arc::clone(&selected_input);
+    let active_loopback_test = Arc::clone(&active_loopback_stream);
+    let active_stream_test = Arc::clone(&active_mic_stream);
+    let level_tx_test = level_tx.clone();
+
+    app.on_toggle_test_mic(move || {
+        let now_testing = !gateway::is_testing_mic();
+        info!("🧪 [TEST MIC] Botão 'Se Ouvir' alternado para: {}", now_testing);
+        gateway::set_testing_mic(now_testing);
+        if let Some(ui) = app_weak_test_mic.upgrade() {
+            ui.set_is_testing_mic(now_testing);
+        }
+        if now_testing {
+            if let Ok(mut q) = gateway::get_mic_loopback_queue().lock() {
+                q.clear();
+            }
+
+            // Ensure hardware mic capture is active so loopback buffer is fed
+            if active_stream_test.lock().unwrap().is_none() {
+                let cur_input = selected_input_test.lock().unwrap().clone();
+                info!("🎙️ [TEST MIC] Microphone inactive, starting capture for: '{}'", cur_input);
+                *active_stream_test.lock().unwrap() = Some(start_mic_capture(cur_input, level_tx_test.clone()));
+            }
+
+            let cur_output = selected_output_test.lock().unwrap().clone();
+            info!("🎧 [TEST MIC] Starting loopback output for: '{}'", cur_output);
+            if let Some(stream) = start_mic_loopback_stream(cur_output) {
+                info!("🎧 [TEST MIC] Stream de saída criado com sucesso!");
+                *active_loopback_test.lock().unwrap() = Some(stream);
+            } else {
+                log::error!("❌ [TEST MIC] Failed to create loopback stream!");
+            }
+        } else {
+            *active_loopback_test.lock().unwrap() = None;
+            if let Ok(mut q) = gateway::get_mic_loopback_queue().lock() {
+                q.clear();
+            }
+        }
+    });
+
+    let app_weak_lang = app_weak.clone();
+    app.on_change_language(move |code: SharedString| {
+        let selected = i18n::Language::from_code(code.as_str());
+        i18n::save_persisted_language_config(selected);
+        if let Some(ui) = app_weak_lang.upgrade() {
+            apply_i18n_translations(&ui, selected);
+        }
+        info!("🌐 Idioma alterado para: {:?} (código: {})", selected, code.as_str());
+    });
+
+    let app_weak_rec = app_weak.clone();
+    app.on_start_recording_keybind(move |target: i32| {
+        keybinds::start_recording(target as u8);
+        if let Some(ui) = app_weak_rec.upgrade() {
+            ui.set_recording_keybind_for(target);
+        }
+        info!("⌨️ [KEYBINDS] Modo gravação alterado para target: {}", target);
+    });
+
+    let keybind_mgr_reset = Arc::clone(&keybind_mgr);
+    let app_weak_reset = app_weak.clone();
+    app.on_reset_keybind(move |target: i32| {
+        let mut cfg = keybind_mgr_reset.get_config();
+        if target == 1 {
+            cfg.mute_shortcut = "None".to_string();
+            if let Some(ui) = app_weak_reset.upgrade() {
+                ui.set_keybind_mute_str("None".into());
+                ui.set_recording_keybind_for(0);
+            }
+        } else if target == 2 {
+            cfg.deafen_shortcut = "None".to_string();
+            if let Some(ui) = app_weak_reset.upgrade() {
+                ui.set_keybind_deafen_str("None".into());
+                ui.set_recording_keybind_for(0);
+            }
+        }
+        keybinds::RECORDING_TARGET.store(0, Ordering::Relaxed);
+        keybind_mgr_reset.update_config(cfg);
+        info!("⌨️ [KEYBINDS] Atalho desativado para target: {}", target);
+    });
+
+    let keybind_mgr_custom = Arc::clone(&keybind_mgr);
+    let app_weak_custom = app_weak.clone();
+    app.on_set_custom_keybind(move |target: i32, shortcut: SharedString| {
+        let mut cfg = keybind_mgr_custom.get_config();
+        let s = shortcut.to_string();
+        if target == 1 {
+            cfg.mute_shortcut = s.clone();
+            if let Some(ui) = app_weak_custom.upgrade() {
+                ui.set_keybind_mute_str(s.into());
+            }
+        } else if target == 2 {
+            cfg.deafen_shortcut = s.clone();
+            if let Some(ui) = app_weak_custom.upgrade() {
+                ui.set_keybind_deafen_str(s.into());
+            }
+        }
+        keybind_mgr_custom.update_config(cfg);
+    });
+
+    // Video & Interface Settings Callbacks
+    let app_weak_enc = app_weak.clone();
+    app.on_select_video_encoder(move |id: SharedString| {
+        video_settings::set_video_encoder(id.to_string());
+        if let Some(ui) = app_weak_enc.upgrade() {
+            populate_video_interface_settings(&ui);
+        }
+    });
+
+    let app_weak_vcap = app_weak.clone();
+    app.on_select_video_capture_backend(move |id: SharedString| {
+        video_settings::set_video_capture_backend(id.to_string());
+        if let Some(ui) = app_weak_vcap.upgrade() {
+            populate_video_interface_settings(&ui);
+        }
+    });
+
+    let app_weak_aloop = app_weak.clone();
+    app.on_select_audio_loopback_backend(move |id: SharedString| {
+        video_settings::set_audio_loopback_backend(id.to_string());
+        if let Some(ui) = app_weak_aloop.upgrade() {
+            populate_video_interface_settings(&ui);
+        }
+    });
+
+    let app_weak_notice = app_weak.clone();
+    app.on_toggle_enable_self_preview_notice(move || {
+        let new_val = video_settings::toggle_enable_self_preview_notice();
+        if let Some(ui) = app_weak_notice.upgrade() {
+            ui.set_enable_self_preview_notice(new_val);
+        }
+    });
+
+    let app_weak_hw = app_weak.clone();
+    app.on_toggle_hardware_monitor(move || {
+        let new_val = video_settings::toggle_show_hardware_monitor();
+        if let Some(ui) = app_weak_hw.upgrade() {
+            ui.set_show_hardware_monitor(new_val);
+        }
+    });
+
+    // Network diagnostics: a few seconds of blocking network checks on their own thread;
+    // the report stays here until "Copy report".
+    let net_diag_report: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let app_weak_net_diag = app.as_weak();
+    let net_diag_report_run = Arc::clone(&net_diag_report);
+    app.on_run_network_diagnostics(move || {
+        if let Some(ui) = app_weak_net_diag.upgrade() {
+            ui.set_net_diag_running(true);
+            ui.set_net_diag_copied(false);
+        }
+        let app_w = app_weak_net_diag.clone();
+        let report_slot = Arc::clone(&net_diag_report_run);
+        let _ = std::thread::Builder::new().name("network-diagnostics".into()).spawn(move || {
+            let diag = screen_capture::net_diagnostics::run();
+            info!("🩺 [DIAGNÓSTICO DE REDE]\n{}", diag.report);
+            *report_slot.lock().unwrap() = diag.report;
+            let verdict = diag.verdict as i32;
+            let signaling_ok = diag.signaling_ms.is_some();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = app_w.upgrade() {
+                    ui.set_net_diag_verdict(verdict);
+                    ui.set_net_diag_signaling_ok(signaling_ok);
+                    ui.set_net_diag_running(false);
+                }
+            });
+        });
+    });
+    let app_weak_net_copy = app.as_weak();
+    app.on_copy_network_diagnostics(move || {
+        let report = net_diag_report.lock().unwrap().clone();
+        let copied = copypasta::ClipboardContext::new()
+            .and_then(|mut ctx| copypasta::ClipboardProvider::set_contents(&mut ctx, report))
+            .is_ok();
+        if let Some(ui) = app_weak_net_copy.upgrade() {
+            ui.set_net_diag_copied(copied);
+        }
+    });
+
+    app.set_channel_sidebar_width(video_settings::get_channel_sidebar_width());
+    app.on_channel_sidebar_width_committed(|width| {
+        video_settings::set_channel_sidebar_width(width);
+    });
+
+    let app_weak_gpu = app.as_weak();
+    app.on_toggle_gpu_renderer(move || {
+        let new_val = video_settings::toggle_use_gpu_renderer();
+        if let Some(ui) = app_weak_gpu.upgrade() {
+            ui.set_use_gpu_renderer(new_val);
+        }
+    });
+
+    let app_weak_theme = app_weak.clone();
+    app.on_toggle_theme(move || {
+        let use_light_theme = video_settings::toggle_use_light_theme();
+        if let Some(ui) = app_weak_theme.upgrade() {
+            ui.set_use_light_theme(use_light_theme);
+        }
+    });
+
+    // Voice Processing Settings Callbacks
+    let app_weak_ns = app_weak.clone();
+    app.on_select_noise_suppression(move |id: SharedString| {
+        video_settings::set_noise_suppression(id.to_string());
+        if let Some(ui) = app_weak_ns.upgrade() {
+            populate_voice_processing_settings(&ui);
+        }
+    });
+
+    let app_weak_aec = app_weak.clone();
+    app.on_toggle_echo_cancellation(move || {
+        let new_val = video_settings::toggle_echo_cancellation();
+        if let Some(ui) = app_weak_aec.upgrade() {
+            ui.set_echo_cancellation(new_val);
+        }
+    });
+
+    let app_weak_agc = app_weak.clone();
+    app.on_toggle_automatic_gain_control(move || {
+        let new_val = video_settings::toggle_automatic_gain_control();
+        if let Some(ui) = app_weak_agc.upgrade() {
+            ui.set_automatic_gain_control(new_val);
+        }
+    });
+
+
+    // Network & Proxy Settings Callbacks
+    let app_weak_proxy_mode = app_weak.clone();
+    app.on_select_proxy_mode(move |id: SharedString| {
+        let mut curr = network_settings::get_network_settings();
+        curr.proxy_mode = id.to_string();
+        network_settings::save_network_settings(&curr);
+        if let Some(ui) = app_weak_proxy_mode.upgrade() {
+            populate_network_proxy_settings(&ui);
+            if curr.proxy_mode == "off" {
+                ui.set_login_alert_message("".into());
+            }
+        }
+    });
+
+    let app_weak_proxy_media = app_weak.clone();
+    app.on_toggle_proxy_route_media(move || {
+        let mut curr = network_settings::get_network_settings();
+        curr.route_media = !curr.route_media;
+        network_settings::save_network_settings(&curr);
+        if let Some(ui) = app_weak_proxy_media.upgrade() {
+            ui.set_proxy_route_media_enabled(curr.route_media);
+        }
+    });
+
+    let app_weak_proxy_save = app_weak.clone();
+    let http_client_proxy_save = Arc::clone(&http_client);
+    let last_token_proxy_save = Arc::clone(&last_token);
+    app.on_save_proxy_settings(move |mode: SharedString, host: SharedString, port_str: SharedString, user: SharedString, pass: SharedString, route_media: bool| {
+        let port = port_str.trim().parse::<u16>().unwrap_or(8080);
+        network_settings::update_network_settings(
+            mode.to_string(),
+            host.to_string(),
+            port,
+            user.to_string(),
+            pass.to_string(),
+            route_media,
+        );
+
+        // Re-instantiate http_client with new proxy settings if logged in
+        let tok = last_token_proxy_save.lock().unwrap().clone();
+        if !tok.is_empty() {
+            let mut client_guard = http_client_proxy_save.lock().unwrap();
+            *client_guard = Some(DiscordHttpClient::new(tok));
+        }
+
+        if let Some(ui) = app_weak_proxy_save.upgrade() {
+            populate_network_proxy_settings(&ui);
+            if mode == "off" {
+                ui.set_login_alert_message("".into());
+            }
+            ui.set_proxy_test_status_text(crate::utils::i18n_ui::ui_text().proxy_saved.into());
+            ui.set_proxy_test_is_success(true);
+        }
+    });
+
+    let app_weak_proxy_test = app_weak.clone();
+    app.on_test_proxy_requested(move |mode: SharedString, host: SharedString, port_str: SharedString, user: SharedString, pass: SharedString| {
+        let port = port_str.trim().parse::<u16>().unwrap_or(8080);
+        let mode_str = mode.to_string();
+        let host_str = host.to_string();
+        let user_str = user.to_string();
+        let pass_str = pass.to_string();
+
+        if let Some(ui) = app_weak_proxy_test.upgrade() {
+            ui.set_proxy_is_testing(true);
+            ui.set_proxy_test_status_text(crate::utils::i18n_ui::ui_text().proxy_testing.into());
+            ui.set_proxy_test_is_success(true);
+        }
+
+        let app_weak_test_task = app_weak_proxy_test.clone();
+        tokio::spawn(async move {
+            // Temporarily build a client with these explicit settings to test
+            let mut builder = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(6))
+                .user_agent(crate::utils::client_identity::user_agent());
+
+            match mode_str.as_str() {
+                "http" | "https" => {
+                    let url = format!("http://{}:{}", host_str.trim(), port);
+                    if let Ok(mut p) = reqwest::Proxy::all(&url) {
+                        if !user_str.is_empty() {
+                            p = p.basic_auth(&user_str, &pass_str);
+                        }
+                        builder = builder.proxy(p);
+                    }
+                }
+                "socks5" => {
+                    let url = format!("socks5://{}:{}", host_str.trim(), port);
+                    if let Ok(mut p) = reqwest::Proxy::all(&url) {
+                        if !user_str.is_empty() {
+                            p = p.basic_auth(&user_str, &pass_str);
+                        }
+                        builder = builder.proxy(p);
+                    }
+                }
+                "system" => {}
+                _ => {
+                    builder = builder.no_proxy();
+                }
+            }
+
+            let client = builder.build().unwrap_or_default();
+            let start = std::time::Instant::now();
+            let test_res = client.get("https://discord.com/api/v10/gateway").send().await;
+
+            let (msg, is_success) = match test_res {
+                Ok(resp) => {
+                    let ms = start.elapsed().as_millis();
+                    if resp.status().is_success() {
+                        (format!("Sucesso! Conectado ao Discord via proxy em {}ms (Status {})", ms, resp.status()), true)
+                    } else {
+                        (format!("Proxy respondeu em {}ms, mas retornou status HTTP {}", ms, resp.status()), false)
+                    }
+                }
+                Err(e) => {
+                    let friendly = if e.is_connect() {
+                        "Falha de conexão: o proxy recusou a conexão ou está offline.".to_string()
+                    } else if e.is_timeout() {
+                        "Tempo esgotado: o servidor proxy demorou para responder.".to_string()
+                    } else {
+                        format!("Error connecting via proxy: {}", e)
+                    };
+                    (friendly, false)
+                }
+            };
+
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = app_weak_test_task.upgrade() {
+                    ui.set_proxy_is_testing(false);
+                    ui.set_proxy_test_status_text(msg.into());
+                    ui.set_proxy_test_is_success(is_success);
+                }
+            });
+        });
+    });
+
+    // Leave Voice Callback
+    let cmd_tx_leave = Arc::clone(&cmd_tx_store);
+    let active_guild_leave = Arc::clone(&active_guild_id);
+    let active_channel_leave = Arc::clone(&active_channel_id);
+    let guilds_map_leave = Arc::clone(&guilds_map);
+    let http_client_leave = Arc::clone(&http_client);
+    let app_weak_leave = app_weak.clone();
+    let sm_leave = Arc::clone(&screen_manager);
+    let hidden_streams_leave = Arc::clone(&hidden_streams);
+    let active_mic_leave = Arc::clone(&active_mic_stream);
+
+    app.on_leave_voice(move || {
+        info!("Usuário solicitou desconexão da sala de voz...");
+        sound_effects::play_ui_sound(sound_effects::UiSound::LeaveChannel);
+        // Close the microphone: it was opened on join and kept capturing after leaving.
+        *active_mic_leave.lock().unwrap() = None;
+        sm_leave.stop();
+        sm_leave.set_context(0, 0, "");
+        screen_capture::clear_stream_audio_queue();
+        hidden_streams_leave.lock().unwrap().clear();
+        screen_capture::watch::clear_wanted();
+        // Do this even if the window has gone away: the next call starts with fresh audio.
+        if let Ok(mut queues) = gateway::get_speaker_pcm_queues().lock() {
+            queues.clear();
+        }
+        if let Ok(mut queue) = gateway::get_mic_pcm_queue().lock() {
+            queue.clear();
+        }
+        if let Some(ui) = app_weak_leave.upgrade() {
+            ui.set_is_in_voice(false);
+            ui.set_is_voice_connecting(false);
+            ui.set_is_voice_focused(false);
+            ui.set_current_voice_channel("".into());
+            ui.set_is_in_dm_call(false); // also ends DM call if it was active
+            ui.set_is_screen_sharing(false);
+            ui.set_show_self_preview_notice(false);
+            ui.set_web_share_active(false);
+            ui.set_web_share_url("".into());
+            ui.set_web_share_viewers(0);
+            ui.set_local_preview_fps("".into());
+            ui.set_remote_stream_fps("".into());
+            ui.set_has_active_stream(false);
+            gateway::clear_voice_participants();
+            let my_uid = gateway::get_my_user_id();
+            if my_uid > 0 {
+                if let Ok(mut gvs) = gateway::get_guild_voice_states_store().lock() {
+                    gvs.remove(&my_uid);
+                }
+            }
+
+            let gid = active_guild_leave.lock().unwrap().clone();
+
+            if let Some(cmd_tx_guard) = cmd_tx_leave.lock().unwrap().as_ref() {
+                let _ = cmd_tx_guard.try_send(GatewayCommand::UpdateVoiceState {
+                    guild_id: gid.clone(),
+                    channel_id: None,
+                    self_mute: false,
+                    self_deaf: false,
+                });
+            }
+
+            // Find the first readable text channel of the current guild
+            let target_text_ch = if let Ok(map) = guilds_map_leave.lock() {
+                map.get(&gid).and_then(|g| {
+                    g.channels.iter().find(|c| !c.is_voice && !c.is_category).cloned()
+                })
+            } else {
+                None
+            };
+
+            if let Some(tch) = target_text_ch {
+                *active_channel_leave.lock().unwrap() = tch.id.clone();
+                let clean_name = crate::utils::styled_text::plain_display_name(tch.name.trim_start_matches('#').trim()).into_owned();
+                let tch_id = tch.id.clone();
+                ui.set_active_channel_name(clean_name.into());
+                ui.set_active_channel_id(tch_id.clone().into());
+
+                let http_opt = http_client_leave.lock().unwrap().as_ref().cloned();
+                let app_w = app_weak_leave.clone();
+                if let Some(http) = http_opt {
+                    tokio::spawn(async move {
+                        load_messages_for_channel(&http, app_w, &tch_id).await;
+                    });
+                }
+            } else {
+                let mut current_msgs: Vec<ChatMessage> = ui.get_messages().iter().collect();
+                current_msgs.push(ChatMessage {
+                    id: "".into(),
+                    author: "kiyora Voice".into(),
+                    content: "🔴 Desconectado da sala de voz.".into(),
+                    commands: slint::ModelRc::default(),
+                    content_lines: slint::ModelRc::default(),
+                    embed_content: "".into(),
+                    embed_lines: slint::ModelRc::default(),
+                    embed_color: slint::Color::from_rgb_u8(88, 101, 242),
+                    embed_footer: "".into(),
+                    code_block: "".into(),
+                    reply_author: "".into(),
+                    reply_content: "".into(),
+                    reply_command: "".into(),
+                    links: slint::ModelRc::default(),
+                    buttons: slint::ModelRc::default(),
+                    attachments: slint::ModelRc::default(),
+                    timestamp: crate::utils::i18n_ui::ui_text().now_label.into(),
+                    show_header: true,
+                    ..Default::default()
+                });
+                let model = std::rc::Rc::new(slint::VecModel::from(current_msgs));
+                ui.set_messages(model.into());
+                request_chat_scroll_to_bottom(app_weak_leave.clone());
+            }
+        }
+    });
+
+    // DM Voice Call Callbacks (Parte 4.1/4.2/4.3)
+    let http_call_dm = Arc::clone(&http_client);
+    let active_ch_call = Arc::clone(&active_channel_id);
+    let cmd_tx_call = Arc::clone(&cmd_tx_store);
+    let selected_input_call = Arc::clone(&selected_input);
+    let active_mic_call = Arc::clone(&active_mic_stream);
+    let level_tx_call = level_tx.clone();
+    let app_weak_call = app_weak.clone();
+
+    app.on_call_dm(move || {
+        let channel_id = active_ch_call.lock().unwrap().clone();
+        if channel_id.is_empty() {
+            return;
+        }
+
+        // ── Step 1: Open voice interface immediately (same flow as voice channels) ──
+        if let Some(ui) = app_weak_call.upgrade() {
+            // Nome da conversa já está no active_channel_name da UI
+            let call_name = ui.get_active_channel_name().to_string();
+            ui.set_is_in_voice(true);
+            ui.set_is_voice_connecting(true);
+            ui.set_is_voice_focused(true);
+            ui.set_is_in_dm_call(true);
+            ui.set_current_voice_channel(call_name.into());
+            sound_effects::play_ui_sound(sound_effects::UiSound::JoinChannel);
+        }
+
+        // ── Step 2: Start microphone capture (same as normal voice channels) ──
+        let mic_name = selected_input_call.lock().unwrap().clone();
+        *active_mic_call.lock().unwrap() = Some(start_mic_capture(mic_name, level_tx_call.clone()));
+        info!("Opening microphone for the DM call...");
+
+        // ── Step 3: Async — REST ring + OP4 VoiceStateUpdate ──
+        let http_opt = http_call_dm.lock().unwrap().as_ref().cloned();
+        let _app_w = app_weak_call.clone();
+        let ch_id = channel_id.clone();
+        let cmd_tx_for_ring = Arc::clone(&cmd_tx_call);
+        tokio::spawn(async move {
+            // 1. Join DM voice room via Gateway OP4 first
+            if let Some(cmd_tx_guard) = cmd_tx_for_ring.lock().unwrap().as_ref() {
+                let _ = cmd_tx_guard.try_send(GatewayCommand::UpdateVoiceState {
+                    guild_id: "@me".to_string(),
+                    channel_id: Some(ch_id.clone()),
+                    self_mute: false,
+                    self_deaf: false,
+                });
+            }
+
+            // Aguarda 150ms para que o Gateway registre o VoiceState antes de disparar o toque
+            tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+
+            // 2. Disparar o toque (ring) para os membros da conversa
+            if let Some(http) = http_opt {
+                if let Err(e) = http.ring_dm_call(&ch_id).await {
+                    warn!("Warning when firing ring on DM {}: {:?} (voice call still active)", ch_id, e);
+                } else {
+                    info!("🔔 DM ring iniciado com sucesso no canal {}", ch_id);
+                }
+            }
+        });
+    });
+
+    let http_hangup_dm = Arc::clone(&http_client);
+    let active_ch_hangup = Arc::clone(&active_channel_id);
+    let cmd_tx_hangup = Arc::clone(&cmd_tx_store);
+    let active_guild_hangup = Arc::clone(&active_guild_id);
+    let active_mic_hangup = Arc::clone(&active_mic_stream);
+    let app_weak_hangup = app_weak.clone();
+
+    app.on_hangup_dm(move || {
+        let channel_id = active_ch_hangup.lock().unwrap().clone();
+        if channel_id.is_empty() {
+            return;
+        }
+
+        // Para o microfone imediatamente
+        *active_mic_hangup.lock().unwrap() = None;
+        sound_effects::play_ui_sound(sound_effects::UiSound::LeaveChannel);
+
+        let http_opt = http_hangup_dm.lock().unwrap().as_ref().cloned();
+        let app_w = app_weak_hangup.clone();
+        let ch_id = channel_id.clone();
+        // REST: stop-ringing
+        let ch_id2 = ch_id.clone();
+        tokio::spawn(async move {
+            if let Some(http) = http_opt {
+                if let Err(e) = http.stop_ringing_dm_call(&ch_id2).await {
+                    warn!("Failed to stop ring on DM {}: {:?}", ch_id2, e);
+                } else {
+                    info!("🔕 DM ring parado no canal {}", ch_id2);
+                }
+            }
+        });
+        // OP4: desconectar do voice
+        let gid = active_guild_hangup.lock().unwrap().clone();
+        if let Some(cmd_tx_guard) = cmd_tx_hangup.lock().unwrap().as_ref() {
+            let _ = cmd_tx_guard.try_send(GatewayCommand::UpdateVoiceState {
+                guild_id: gid,
+                channel_id: None,
+                self_mute: false,
+                self_deaf: false,
+            });
+        }
+        if let Some(ui) = app_w.upgrade() {
+            ui.set_is_in_dm_call(false);
+            ui.set_is_in_voice(false);
+            ui.set_is_voice_connecting(false);
+            ui.set_is_voice_focused(false);
+            ui.set_current_voice_channel("".into());
+            gateway::clear_voice_participants();
+        }
+    });
+
+    // Accept incoming DM call
+    let cmd_tx_accept = Arc::clone(&cmd_tx_store);
+    let http_accept = Arc::clone(&http_client);
+    let selected_input_accept = Arc::clone(&selected_input);
+    let active_mic_accept = Arc::clone(&active_mic_stream);
+    let level_tx_accept = level_tx.clone();
+    let app_weak_accept = app_weak.clone();
+
+    app.on_accept_call(move || {
+        if let Some(ui) = app_weak_accept.upgrade() {
+            let ch_id = ui.get_incoming_call_channel_id().to_string();
+            let caller = ui.get_incoming_call_caller_name().to_string();
+            if ch_id.is_empty() { return; }
+
+            // Fechar painel + abrir interface de voz
+            ui.set_has_incoming_call(false);
+            ui.set_incoming_call_channel_id("".into());
+            ui.set_is_in_voice(true);
+            ui.set_is_voice_connecting(true);
+            ui.set_is_voice_focused(true);
+            ui.set_is_in_dm_call(true);
+            ui.set_current_voice_channel(caller.into());
+            sound_effects::play_ui_sound(sound_effects::UiSound::JoinChannel);
+
+            // Iniciar mic
+            let mic_name = selected_input_accept.lock().unwrap().clone();
+            *active_mic_accept.lock().unwrap() = Some(start_mic_capture(mic_name, level_tx_accept.clone()));
+
+            // OP4: entrar no canal de voz da DM
+            if let Some(cmd_tx_guard) = cmd_tx_accept.lock().unwrap().as_ref() {
+                let _ = cmd_tx_guard.try_send(GatewayCommand::UpdateVoiceState {
+                    guild_id: "@me".to_string(),
+                    channel_id: Some(ch_id.clone()),
+                    self_mute: false,
+                    self_deaf: false,
+                });
+            }
+
+            // REST: stop-ringing para parar o toque no chamador
+            let http_opt = http_accept.lock().unwrap().as_ref().cloned();
+            tokio::spawn(async move {
+                if let Some(http) = http_opt {
+                    let _ = http.stop_ringing_dm_call(&ch_id).await;
+                }
+            });
+        }
+    });
+
+    // Reject incoming DM call
+    let http_reject = Arc::clone(&http_client);
+    let app_weak_reject = app_weak.clone();
+
+    app.on_reject_call(move || {
+        if let Some(ui) = app_weak_reject.upgrade() {
+            let ch_id = ui.get_incoming_call_channel_id().to_string();
+            ui.set_has_incoming_call(false);
+            ui.set_incoming_call_channel_id("".into());
+            ui.set_incoming_call_caller_name("".into());
+
+            // REST: stop-ringing para parar o toque
+            if !ch_id.is_empty() {
+                let http_opt = http_reject.lock().unwrap().as_ref().cloned();
+                tokio::spawn(async move {
+                    if let Some(http) = http_opt {
+                        let _ = http.stop_ringing_dm_call(&ch_id).await;
+                    }
+                });
+            }
+        }
+    });
+
+    // Auto-Update Callbacks
+    let app_weak_update_acc = app_weak.clone();
+    app.on_update_app_accept(move || {
+        let rel_opt = get_pending_update_store().lock().unwrap().clone();
+        if let Some(rel) = rel_opt {
+            if let Some(ui) = app_weak_update_acc.upgrade() {
+                ui.set_is_updating(true);
+                ui.set_update_progress(0.0);
+                ui.set_update_status_text(crate::utils::i18n_ui::ui_text().update_downloading.into());
+            }
+
+            let (prog_tx, mut prog_rx) = mpsc::channel::<f32>(50);
+            let app_w_prog = app_weak_update_acc.clone();
+            tokio::spawn(async move {
+                while let Some(prog) = prog_rx.recv().await {
+                    let app_w = app_w_prog.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = app_w.upgrade() {
+                            ui.set_update_progress(prog);
+                        }
+                    });
+                }
+            });
+
+            let app_w_fail = app_weak_update_acc.clone();
+            tokio::spawn(async move {
+                if let Err(e) = updater::download_and_install_update(rel.download_url, prog_tx).await {
+                    error!("Error updating Kiyora: {}", e);
+                    let app_w = app_w_fail.clone();
+                    let err_msg = format!("Update failed: {}", e);
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = app_w.upgrade() {
+                            ui.set_is_updating(false);
+                            ui.set_update_status_text(err_msg.into());
+                        }
+                    });
+                }
+            });
+        }
+    });
+
+    let app_weak_update_dism = app_weak.clone();
+    app.on_update_app_dismiss(move || {
+        if let Some(ui) = app_weak_update_dism.upgrade() {
+            ui.set_show_update_dialog(false);
+        }
+    });
+
+    let app_weak_update_ign = app_weak.clone();
+    app.on_update_app_ignore(move || {
+        if let Some(rel) = get_pending_update_store().lock().unwrap().as_ref() {
+            updater::save_ignored_version(&rel.tag_name);
+        }
+        if let Some(ui) = app_weak_update_ign.upgrade() {
+            ui.set_show_update_dialog(false);
+        }
+    });
+
+    // Manual "Check for Updates" Button Callback
+    let app_weak_manual_chk = app_weak.clone();
+    app.on_check_for_updates(move || {
+        let app_w = app_weak_manual_chk.clone();
+
+        if let Some(ui) = app_w.upgrade() {
+            ui.set_is_checking_update(true);
+            ui.set_update_check_feedback(crate::utils::i18n_ui::ui_text().update_comparing.into());
+        }
+
+        tokio::spawn(async move {
+            let res = updater::check_for_updates_manual().await;
+            let app_w_inner = app_w.clone();
+
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = app_w_inner.upgrade() {
+                    ui.set_is_checking_update(false);
+                    match res {
+                        Ok(info) => {
+                            ui.set_update_check_feedback(info.formatted_status.clone().into());
+                            if info.status == updater::VersionComparisonStatus::Outdated {
+                                let rel = updater::ReleaseInfo {
+                                    tag_name: info.remote_tag,
+                                    version: info.remote_version.clone(),
+                                    download_url: info.download_url,
+                                    release_name: info.release_name.clone(),
+                                    release_body: info.release_body,
+                                };
+                                *get_pending_update_store().lock().unwrap() = Some(rel);
+                                ui.set_update_version(format!("v{}", info.remote_version).into());
+                                ui.set_update_release_name(info.release_name.into());
+                                ui.set_show_update_dialog(true);
+                            }
+                        }
+                        Err(e) => {
+                            ui.set_update_check_feedback(format!("Erro: {}", e).into());
+                        }
+                    }
+                }
+            });
+        });
+    });
+
+    // Chat Pagination: Load Older Messages Callback
+    let app_weak_older = app_weak.clone();
+    let http_client_older = Arc::clone(&http_client);
+    let active_ch_older = Arc::clone(&active_channel_id);
+    app.on_load_older_messages(move || {
+        let app_w = app_weak_older.clone();
+        let http_opt = http_client_older.lock().unwrap().clone();
+        let ch_id = active_ch_older.lock().unwrap().clone();
+
+        if ch_id.is_empty() {
+            return;
+        }
+
+        let oldest_id_opt = get_oldest_message_map().lock().unwrap().get(&ch_id).cloned();
+        let oldest_id = match oldest_id_opt {
+            Some(id) if !id.is_empty() => id,
+            _ => return,
+        };
+
+        if let Some(http) = http_opt {
+            if let Some(ui) = app_w.upgrade() {
+                ui.set_is_loading_older_messages(true);
+            }
+
+            let app_w_inner = app_w.clone();
+            let ch_id_clone = ch_id.clone();
+            tokio::spawn(async move {
+                match http.get_channel_messages_before(&ch_id_clone, &oldest_id).await {
+                    Ok(msgs_val) => {
+                        let has_more = msgs_val.len() >= 30;
+                        if let Some(oldest) = msgs_val.last() {
+                            if let Some(id_str) = oldest["id"].as_str() {
+                                get_oldest_message_map().lock().unwrap().insert(ch_id_clone.clone(), id_str.to_string());
+                            }
+                        }
+
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = app_w_inner.upgrade() {
+                                ui.set_is_loading_older_messages(false);
+                                ui.set_has_more_older_messages(has_more);
+
+                                let older_slint_msgs: Vec<ChatMessage> = msgs_val.iter().rev().map(|m| {
+                                    let msg_id = m["id"].as_str().unwrap_or("");
+                                    let author = format_discord_author(m);
+                                    let (content, commands, content_lines, embed_content, embed_lines, embed_color, embed_footer, code_block, reply_author, reply_content, reply_command, links, buttons, attachments) = format_discord_message_parts(m);
+                                    
+                                    let slint_cmds: Vec<slint::SharedString> = commands.into_iter().map(|c| c.into()).collect();
+                                    let commands_model = std::rc::Rc::new(slint::VecModel::from(slint_cmds));
+
+                                    let slint_links: Vec<LinkItem> = links.iter().map(|l| LinkItem {
+                                        label: l.label.clone().into(),
+                                        url: l.url.clone().into(),
+                                    }).collect();
+                                    let links_model = std::rc::Rc::new(slint::VecModel::from(slint_links));
+
+                                    let mut message = ChatMessage {
+                                        id: msg_id.into(),
+                                        author: author.into(),
+                                        content: content.into(),
+                                        commands: slint::ModelRc::from(commands_model),
+                                        content_lines: map_message_lines(&content_lines, &ch_id_clone, &app_w_inner),
+                                        embed_content: embed_content.into(),
+                                        embed_lines: map_message_lines(&embed_lines, &ch_id_clone, &app_w_inner),
+                                        embed_color: parse_hex_color(&embed_color),
+                                        embed_footer: embed_footer.into(),
+                                        code_block: code_block.into(),
+                                        reply_author: reply_author.into(),
+                                        reply_content: reply_content.into(),
+                                        reply_command: reply_command.into(),
+                                        links: slint::ModelRc::from(links_model),
+                                        buttons: map_message_buttons(&buttons, &ch_id_clone, &app_w_inner),
+                                        attachments: map_message_attachments(&attachments, &app_w_inner),
+                                        timestamp: "Anterior".into(),
+                                        ..Default::default()
+                                    };
+                                    apply_message_metadata(&mut message, m);
+                                    message
+                                }).collect();
+
+                                let current_msgs: Vec<ChatMessage> = ui.get_messages().iter().collect();
+                                let mut combined = older_slint_msgs;
+                                combined.extend(current_msgs);
+                                regroup_messages(&mut combined);
+                                avatar_cache::get_avatar_cache().hydrate(&mut combined, &app_w_inner);
+                                crate::ui::invite_cards::hydrate(&mut combined, &app_w_inner);
+                                let model = std::rc::Rc::new(slint::VecModel::from(combined));
+                                ui.set_messages(model.into());
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        error!("Error loading previous messages: {}", e);
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = app_w_inner.upgrade() {
+                                ui.set_is_loading_older_messages(false);
+                            }
+                        });
+                    }
+                }
+            });
+        }
+    });
+
+    // Active QR Code Remote Auth Session
+    let (qr_tx, mut qr_rx) = mpsc::channel::<RemoteAuthEvent>(50);
+    let active_qr_session: Arc<Mutex<Option<remote_auth::RemoteAuthSession>>> = Arc::new(Mutex::new(None));
+
+    let qr_tx_refresh = qr_tx.clone();
+    let active_qr_refresh = Arc::clone(&active_qr_session);
+    let app_weak_refresh = app_weak.clone();
+    app.on_refresh_qr_code(move || {
+        info!("🔄 Updating / refreshing login QR Code...");
+        if let Some(ui) = app_weak_refresh.upgrade() {
+            ui.set_has_qr_code(false);
+            ui.set_qr_scanned_user("".into());
+        }
+        if let Some(old) = active_qr_refresh.lock().unwrap().take() {
+            old.cancel();
+        }
+        let session = remote_auth::RemoteAuthSession::start(qr_tx_refresh.clone());
+        *active_qr_refresh.lock().unwrap() = Some(session);
+    });
+
+    // QR Code Event Processing Loop
+    let app_weak_qr = app_weak.clone();
+    let http_client_qr = Arc::clone(&http_client);
+    let last_token_qr = Arc::clone(&last_token);
+    let guilds_map_qr = Arc::clone(&guilds_map);
+    let active_guild_qr = Arc::clone(&active_guild_id);
+    let active_channel_qr = Arc::clone(&active_channel_id);
+    let cmd_tx_qr = Arc::clone(&cmd_tx_store);
+    let event_tx_qr = event_tx.clone();
+    let active_qr_session_qr = Arc::clone(&active_qr_session);
+
+    tokio::spawn(async move {
+        while let Some(evt) = qr_rx.recv().await {
+            match evt {
+                RemoteAuthEvent::QrCodeUrl(url) => {
+                    let app_w = app_weak_qr.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Ok(img) = remote_auth::generate_qr_image(&url) {
+                            if let Some(ui) = app_w.upgrade() {
+                                ui.set_qr_code_image(img);
+                                ui.set_has_qr_code(true);
+                                ui.set_qr_scanned_user("".into());
+                            }
+                        }
+                    });
+                }
+                RemoteAuthEvent::UserScanned { username, .. } => {
+                    let app_w = app_weak_qr.clone();
+                    let uname = username.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = app_w.upgrade() {
+                            ui.set_qr_scanned_user(uname.into());
+                        }
+                    });
+                }
+                RemoteAuthEvent::TokenReceived(token) => {
+                    info!("🎉 Token de acesso recebido via QR Code com sucesso! Conectando...");
+                    let app_w = app_weak_qr.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = app_w.upgrade() {
+                            ui.set_has_qr_code(false);
+                            ui.set_qr_scanned_user("".into());
+                            ui.set_login_alert_message("".into());
+                            ui.set_connection_status("Conectando via QR Code...".into());
+                        }
+                    });
+                    if let Some(old) = active_qr_session_qr.lock().unwrap().take() {
+                        old.cancel();
+                    }
+                    try_login_with_candidates(
+                        vec![token],
+                        app_weak_qr.clone(),
+                        Arc::clone(&http_client_qr),
+                        Arc::clone(&last_token_qr),
+                        Arc::clone(&guilds_map_qr),
+                        Arc::clone(&active_guild_qr),
+                        Arc::clone(&active_channel_qr),
+                        Arc::clone(&cmd_tx_qr),
+                        event_tx_qr.clone(),
+                    ).await;
+                }
+                RemoteAuthEvent::Cancelled => {
+                    let app_w = app_weak_qr.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = app_w.upgrade() {
+                            ui.set_has_qr_code(false);
+                            ui.set_qr_scanned_user("".into());
+                            ui.set_login_alert_message(crate::utils::i18n_ui::ui_text().qr_expired.into());
+                            ui.set_login_alert_is_error(false);
+                        }
+                    });
+                }
+                RemoteAuthEvent::Error(err) => {
+                    warn!("⚠️ Erro na sessão de QR Auth: {}", err);
+                    let app_w = app_weak_qr.clone();
+                    let err_clone = err.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = app_w.upgrade() {
+                            ui.set_has_qr_code(false);
+                            if crate::utils::is_proxy_error(&err_clone) {
+                                ui.set_login_alert_message(crate::utils::format_proxy_alert_message().into());
+                                ui.set_login_alert_is_error(true);
+                            } else if err_clone.contains("captcha-required") || err_clone.contains("captcha") {
+                                ui.set_login_alert_message(crate::utils::i18n_ui::ui_text().qr_captcha.into());
+                                ui.set_login_alert_is_error(true);
+                            } else {
+                                ui.set_login_alert_message(format!("Falha no QR Code: {}", err_clone).into());
+                                ui.set_login_alert_is_error(true);
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    // Logout Callback from UI
+    let app_weak_logout = app_weak.clone();
+    let http_client_logout = Arc::clone(&http_client);
+    let last_token_logout = Arc::clone(&last_token);
+    let guilds_map_logout = Arc::clone(&guilds_map);
+    let active_guild_logout = Arc::clone(&active_guild_id);
+    let active_channel_logout = Arc::clone(&active_channel_id);
+    let cmd_tx_logout = Arc::clone(&cmd_tx_store);
+    let active_mic_logout = Arc::clone(&active_mic_stream);
+    let active_loopback_logout = Arc::clone(&active_loopback_stream);
+    let qr_tx_logout = qr_tx.clone();
+    let active_qr_logout = Arc::clone(&active_qr_session);
+
+    app.on_logout(move || {
+        info!("Usuário solicitou Logout completo de todas as contas...");
+        // 1. Remove saved vault file so all saved tokens are wiped
+        delete_secure_token();
+
+        // 2. Disconnect voice session if active
+        gateway::clear_voice_participants();
+        gateway::CURRENT_VOICE_SESSION_ID.store(0, std::sync::atomic::Ordering::SeqCst);
+        gateway::set_testing_mic(false);
+
+        // 3. Send disconnect command if gateway is active
+        let gid = active_guild_logout.lock().unwrap().clone();
+        if let Some(cmd_tx) = cmd_tx_logout.lock().unwrap().as_ref() {
+            let _ = cmd_tx.try_send(GatewayCommand::UpdateVoiceState {
+                guild_id: gid,
+                channel_id: None,
+                self_mute: false,
+                self_deaf: false,
+            });
+        }
+
+        // 4. Reset backend states
+        crate::ui::helpers::reset_unread_and_dedup_state();
+        *cmd_tx_logout.lock().unwrap() = None;
+        *http_client_logout.lock().unwrap() = None;
+        *last_token_logout.lock().unwrap() = String::new();
+        *guilds_map_logout.lock().unwrap() = std::collections::HashMap::new();
+        *active_guild_logout.lock().unwrap() = String::new();
+        *active_channel_logout.lock().unwrap() = String::new();
+        *active_mic_logout.lock().unwrap() = None;
+        *active_loopback_logout.lock().unwrap() = None;
+        if let Ok(mut q) = gateway::get_mic_loopback_queue().lock() {
+            q.clear();
+        }
+
+        // 5. Update Slint UI to login state
+        if let Some(ui) = app_weak_logout.upgrade() {
+            ui.set_is_logged_in(false);
+            ui.set_user_tag(crate::utils::i18n_ui::ui_text().not_connected.into());
+            ui.set_user_display_name("".into());
+            ui.set_user_handle("".into());
+            ui.set_user_avatar_initials("".into());
+            ui.set_user_avatar_has_image(false);
+            ui.set_user_avatar_img(slint::Image::default());
+            ui.set_user_avatar_url("".into());
+            ui.set_connection_status(crate::utils::i18n_ui::ui_text().signed_out.into());
+            ui.set_is_in_voice(false);
+            ui.set_current_voice_channel("".into());
+            ui.set_show_user_menu(false);
+            ui.set_show_settings_modal(false);
+            ui.set_is_testing_mic(false);
+            ui.set_guilds(std::rc::Rc::new(slint::VecModel::default()).into());
+            ui.set_channels(std::rc::Rc::new(slint::VecModel::default()).into());
+            ui.set_voice_participants(std::rc::Rc::new(slint::VecModel::default()).into());
+            ui.set_saved_accounts(slint::ModelRc::new(slint::VecModel::from(vec![])));
+            ui.set_total_dm_unread_count(0);
+            ui.set_has_qr_code(false);
+            ui.set_qr_scanned_user("".into());
+        }
+
+        // 6. Start fresh QR Code session for fast re-login
+        if let Some(old) = active_qr_logout.lock().unwrap().take() {
+            old.cancel();
+        }
+        let session = remote_auth::RemoteAuthSession::start(qr_tx_logout.clone());
+        *active_qr_logout.lock().unwrap() = Some(session);
+    });
+
+    // Switch Account Callback from UI
+    let app_weak_sw = app_weak.clone();
+    let http_client_sw = Arc::clone(&http_client);
+    let last_token_sw = Arc::clone(&last_token);
+    let guilds_map_sw = Arc::clone(&guilds_map);
+    let active_guild_sw = Arc::clone(&active_guild_id);
+    let active_channel_sw = Arc::clone(&active_channel_id);
+    let cmd_tx_sw = Arc::clone(&cmd_tx_store);
+    let active_mic_sw = Arc::clone(&active_mic_stream);
+    let active_loopback_sw = Arc::clone(&active_loopback_stream);
+    let active_qr_sw = Arc::clone(&active_qr_session);
+    let event_tx_sw = event_tx.clone();
+
+    app.on_switch_account(move |account_id: SharedString| {
+        let acc_id_str = account_id.to_string();
+        info!("🔄 Alternando para a conta com identificador {}...", acc_id_str);
+
+        let mut vault = load_account_vault();
+        let mut target_token = String::new();
+        let mut found = false;
+        for a in &mut vault.accounts {
+            if a.user_id == acc_id_str || a.token == acc_id_str {
+                a.is_active = true;
+                target_token = a.token.clone();
+                found = true;
+            } else {
+                a.is_active = false;
+            }
+        }
+        if !found {
+            warn!("Conta {} não encontrada no cofre.", acc_id_str);
+            return;
+        }
+        save_account_vault(&vault);
+        sync_ui_saved_accounts(&app_weak_sw, &vault);
+
+        // Disconnect voice session if active
+        gateway::clear_voice_participants();
+        gateway::CURRENT_VOICE_SESSION_ID.store(0, std::sync::atomic::Ordering::SeqCst);
+        gateway::set_testing_mic(false);
+
+        // Send disconnect command if gateway is active
+        let gid = active_guild_sw.lock().unwrap().clone();
+        if let Some(cmd_tx) = cmd_tx_sw.lock().unwrap().as_ref() {
+            let _ = cmd_tx.try_send(GatewayCommand::UpdateVoiceState {
+                guild_id: gid,
+                channel_id: None,
+                self_mute: false,
+                self_deaf: false,
+            });
+        }
+
+        // Cancel QR session if active
+        if let Some(old) = active_qr_sw.lock().unwrap().take() {
+            old.cancel();
+        }
+
+        // Reset backend states
+        crate::ui::helpers::reset_unread_and_dedup_state();
+        *cmd_tx_sw.lock().unwrap() = None;
+        *http_client_sw.lock().unwrap() = None;
+        *last_token_sw.lock().unwrap() = target_token.clone();
+        *guilds_map_sw.lock().unwrap() = std::collections::HashMap::new();
+        *active_guild_sw.lock().unwrap() = String::new();
+        *active_channel_sw.lock().unwrap() = String::new();
+        *active_mic_sw.lock().unwrap() = None;
+        *active_loopback_sw.lock().unwrap() = None;
+        if let Ok(mut q) = gateway::get_mic_loopback_queue().lock() {
+            q.clear();
+        }
+
+        if let Some(ui) = app_weak_sw.upgrade() {
+            ui.set_is_logged_in(false);
+            ui.set_connection_status("Alternando conta e conectando ao Discord...".into());
+            ui.set_is_in_voice(false);
+            ui.set_current_voice_channel("".into());
+            ui.set_show_user_menu(false);
+            ui.set_show_settings_modal(false);
+            ui.set_is_testing_mic(false);
+            ui.set_guilds(std::rc::Rc::new(slint::VecModel::default()).into());
+            ui.set_channels(std::rc::Rc::new(slint::VecModel::default()).into());
+            ui.set_voice_participants(std::rc::Rc::new(slint::VecModel::default()).into());
+            ui.set_total_dm_unread_count(0);
+        }
+
+        let app_w = app_weak_sw.clone();
+        let http_c = Arc::clone(&http_client_sw);
+        let last_t = Arc::clone(&last_token_sw);
+        let g_map = Arc::clone(&guilds_map_sw);
+        let a_gid = Arc::clone(&active_guild_sw);
+        let a_cid = Arc::clone(&active_channel_sw);
+        let c_tx = Arc::clone(&cmd_tx_sw);
+        let ev_tx = event_tx_sw.clone();
+
+        tokio::spawn(async move {
+            try_login_with_candidates(
+                vec![target_token],
+                app_w,
+                http_c,
+                last_t,
+                g_map,
+                a_gid,
+                a_cid,
+                c_tx,
+                ev_tx,
+            ).await;
+        });
+    });
+
+    // Add New Account Callback from UI
+    let app_weak_add = app_weak.clone();
+    let http_client_add = Arc::clone(&http_client);
+    let last_token_add = Arc::clone(&last_token);
+    let guilds_map_add = Arc::clone(&guilds_map);
+    let active_guild_add = Arc::clone(&active_guild_id);
+    let active_channel_add = Arc::clone(&active_channel_id);
+    let cmd_tx_add = Arc::clone(&cmd_tx_store);
+    let active_mic_add = Arc::clone(&active_mic_stream);
+    let active_loopback_add = Arc::clone(&active_loopback_stream);
+    let qr_tx_add = qr_tx.clone();
+    let active_qr_add = Arc::clone(&active_qr_session);
+
+    app.on_add_new_account(move || {
+        info!("➕ Usuário solicitou adicionar nova conta...");
+        // Disconnect voice session if active
+        gateway::clear_voice_participants();
+        gateway::CURRENT_VOICE_SESSION_ID.store(0, std::sync::atomic::Ordering::SeqCst);
+        gateway::set_testing_mic(false);
+
+        // Send disconnect command if gateway is active
+        let gid = active_guild_add.lock().unwrap().clone();
+        if let Some(cmd_tx) = cmd_tx_add.lock().unwrap().as_ref() {
+            let _ = cmd_tx.try_send(GatewayCommand::UpdateVoiceState {
+                guild_id: gid,
+                channel_id: None,
+                self_mute: false,
+                self_deaf: false,
+            });
+        }
+
+        // Reset backend states in-memory (vault remains intact with existing accounts)
+        crate::ui::helpers::reset_unread_and_dedup_state();
+        *cmd_tx_add.lock().unwrap() = None;
+        *http_client_add.lock().unwrap() = None;
+        *last_token_add.lock().unwrap() = String::new();
+        *guilds_map_add.lock().unwrap() = std::collections::HashMap::new();
+        *active_guild_add.lock().unwrap() = String::new();
+        *active_channel_add.lock().unwrap() = String::new();
+        *active_mic_add.lock().unwrap() = None;
+        *active_loopback_add.lock().unwrap() = None;
+        if let Ok(mut q) = gateway::get_mic_loopback_queue().lock() {
+            q.clear();
+        }
+
+        // Update Slint UI to login state
+        if let Some(ui) = app_weak_add.upgrade() {
+            ui.set_is_logged_in(false);
+            ui.set_user_tag(crate::utils::i18n_ui::ui_text().not_connected.into());
+            ui.set_user_display_name("".into());
+            ui.set_user_handle("".into());
+            ui.set_user_avatar_initials("".into());
+            ui.set_user_avatar_has_image(false);
+            ui.set_user_avatar_img(slint::Image::default());
+            ui.set_user_avatar_url("".into());
+            ui.set_connection_status("Conecte a nova conta escaneando o QR Code ou inserindo o Token.".into());
+            ui.set_is_in_voice(false);
+            ui.set_current_voice_channel("".into());
+            ui.set_show_user_menu(false);
+            ui.set_show_settings_modal(false);
+            ui.set_is_testing_mic(false);
+            ui.set_guilds(std::rc::Rc::new(slint::VecModel::default()).into());
+            ui.set_channels(std::rc::Rc::new(slint::VecModel::default()).into());
+            ui.set_voice_participants(std::rc::Rc::new(slint::VecModel::default()).into());
+            ui.set_total_dm_unread_count(0);
+            ui.set_has_qr_code(false);
+            ui.set_qr_scanned_user("".into());
+        }
+
+        // Start fresh QR Code session for fast login
+        if let Some(old) = active_qr_add.lock().unwrap().take() {
+            old.cancel();
+        }
+        let session = remote_auth::RemoteAuthSession::start(qr_tx_add.clone());
+        *active_qr_add.lock().unwrap() = Some(session);
+    });
+
+    // Remove Single Account Callback from UI
+    let app_weak_rem = app_weak.clone();
+    app.on_remove_account(move |account_id: SharedString| {
+        let acc_id_str = account_id.to_string();
+        info!("🗑️ Removendo conta {} do cofre...", acc_id_str);
+        let vault = remove_single_account(&acc_id_str);
+        sync_ui_saved_accounts(&app_weak_rem, &vault);
+    });
+
+    // Login Callback from UI
+    let event_tx_clone = event_tx.clone();
+    let http_client_clone = Arc::clone(&http_client);
+    let app_weak_login = app_weak.clone();
+    let last_token_login = Arc::clone(&last_token);
+    let guilds_map_login = Arc::clone(&guilds_map);
+    let active_guild_login = Arc::clone(&active_guild_id);
+    let active_channel_login = Arc::clone(&active_channel_id);
+    let cmd_tx_login = Arc::clone(&cmd_tx_store);
+    let active_qr_login = Arc::clone(&active_qr_session);
+
+    app.on_login(move |token: SharedString| {
+        let token_str = token.to_string().chars().filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'').collect::<String>();
+        info!("Token fornecido. Validando via API HTTP...");
+        *last_token_login.lock().unwrap() = token_str.clone();
+
+        if let Some(old) = active_qr_login.lock().unwrap().take() {
+            old.cancel();
+        }
+
+        let http = DiscordHttpClient::new(token_str.clone());
+        *http_client_clone.lock().unwrap() = Some(http.clone());
+
+        if let Some(ui) = app_weak_login.upgrade() {
+            ui.set_connection_status("Validando Token na API do Discord...".into());
+        }
+
+        let event_tx_gw = event_tx_clone.clone();
+        let app_weak_inner = app_weak_login.clone();
+        let guilds_map_in = Arc::clone(&guilds_map_login);
+        let active_guild_in = Arc::clone(&active_guild_login);
+        let active_channel_in = Arc::clone(&active_channel_login);
+        let cmd_tx_gw_store = Arc::clone(&cmd_tx_login);
+
+        tokio::spawn(async move {
+            match http.get_current_user().await {
+                Ok(user_info) => {
+                    let username = user_info["username"].as_str().unwrap_or("User");
+                    let user_id = user_info["id"].as_str().unwrap_or("");
+                    let global_name = user_info["global_name"].as_str().unwrap_or(username);
+                    let tag = if let Some(discrim) = user_info["discriminator"].as_str() {
+                        if discrim != "0" {
+                            format!("{}#{}", username, discrim)
+                        } else {
+                            format!("@{}", username)
+                        }
+                    } else {
+                        format!("@{}", username)
+                    };
+                    let display_tag = if !global_name.is_empty() && global_name != username {
+                        format!("{} ({})", global_name, tag)
+                    } else {
+                        tag.clone()
+                    };
+                    info!("Token VÁLIDO! Usuário autenticado: {} ({})", username, user_id);
+
+                    let vault = save_or_update_account(&token_str, user_id, global_name, &tag);
+                    sync_ui_saved_accounts(&app_weak_inner, &vault);
+
+                    let avatar_hash = user_info["avatar"].as_str().unwrap_or("");
+                    let avatar_url = if !avatar_hash.is_empty() && !user_id.is_empty() {
+                        format!("https://cdn.discordapp.com/avatars/{}/{}.png?size=64", user_id, avatar_hash)
+                    } else {
+                        String::new()
+                    };
+                    let display_name_val = if !global_name.is_empty() {
+                        global_name.to_string()
+                    } else {
+                        username.to_string()
+                    };
+                    let handle_val = tag.clone();
+                    let initials_val = crate::ui::helpers::get_guild_initials(&display_name_val);
+
+                    let app_w = app_weak_inner.clone();
+                    let display_tag_clone = display_tag.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = app_w.upgrade() {
+                            ui.set_is_logged_in(true);
+                            ui.set_user_tag(display_tag_clone.into());
+                            ui.set_user_display_name(display_name_val.into());
+                            ui.set_user_handle(handle_val.into());
+                            ui.set_user_avatar_initials(initials_val.into());
+                            ui.set_user_avatar_url(avatar_url.clone().into());
+                            if !avatar_url.is_empty() {
+                                let img = avatar_cache::get_avatar_cache().image_for(&avatar_url);
+                                if img.size().width > 0 {
+                                ui.set_user_avatar_img(img);
+                                ui.set_user_avatar_has_image(true);
+                                }
+                            }
+                            ui.set_connection_status("Conectado com sucesso!".into());
+                            ui.set_login_alert_message("".into());
+                            ui.set_titlebar_error("".into());
+                        }
+                    });
+
+                    // Start Gateway WebSocket connection with Opcode 4 command channel
+                    let (cmd_tx, cmd_rx) = mpsc::channel::<GatewayCommand>(100);
+                    *cmd_tx_gw_store.lock().unwrap() = Some(cmd_tx);
+
+                    // Fetch all servers and channels via HTTP REST immediately!
+                    fetch_and_populate_guilds(
+                        &http,
+                        app_weak_inner.clone(),
+                        guilds_map_in,
+                        active_guild_in,
+                        active_channel_in,
+                        cmd_tx_gw_store,
+                    ).await;
+
+                    let gw = Arc::new(GatewayClient::new(token_str, event_tx_gw));
+                    gw.start(cmd_rx).await;
+                }
+                Err(err_msg) => {
+                    error!("Token validation failed: {}", err_msg);
+                    let app_w = app_weak_inner.clone();
+                    let err_clone = err_msg.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = app_w.upgrade() {
+                            if crate::utils::is_proxy_error(&err_clone) {
+                                ui.set_connection_status(format!("❌ {}", crate::utils::i18n_ui::ui_text().proxy_failed.replace("{}", &crate::utils::get_network_settings().proxy_mode.to_uppercase())).into());
+                                ui.set_login_alert_message(crate::utils::format_proxy_alert_message().into());
+                            } else {
+                                ui.set_connection_status(format!("❌ {}", err_clone).into());
+                                ui.set_login_alert_message(format!("Token recusado pelo Discord: {}", err_clone).into());
+                            }
+                            ui.set_login_alert_is_error(true);
+                        }
+                    });
+                }
+            }
+        });
+    });
+
+    // Callback for Auto-Detect Token Button on Login UI
+    let event_tx_auto_btn = event_tx.clone();
+    let http_client_auto_btn = Arc::clone(&http_client);
+    let app_weak_auto_btn = app_weak.clone();
+    let last_token_auto_btn = Arc::clone(&last_token);
+    let guilds_map_auto_btn = Arc::clone(&guilds_map);
+    let active_guild_auto_btn = Arc::clone(&active_guild_id);
+    let active_channel_auto_btn = Arc::clone(&active_channel_id);
+    let cmd_tx_auto_btn = Arc::clone(&cmd_tx_store);
+    let active_qr_auto = Arc::clone(&active_qr_session);
+
+    app.on_auto_detect_token(move || {
+        if let Some(old) = active_qr_auto.lock().unwrap().take() {
+            old.cancel();
+        }
+
+        let app_w = app_weak_auto_btn.clone();
+        let event_tx_gw = event_tx_auto_btn.clone();
+        let http_client_inner = Arc::clone(&http_client_auto_btn);
+        let last_token_inner = Arc::clone(&last_token_auto_btn);
+        let guilds_map_inner = Arc::clone(&guilds_map_auto_btn);
+        let active_g_inner = Arc::clone(&active_guild_auto_btn);
+        let active_c_inner = Arc::clone(&active_channel_auto_btn);
+        let cmd_tx_inner = Arc::clone(&cmd_tx_auto_btn);
+
+        let app_w_status = app_w.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = app_w_status.upgrade() {
+                ui.set_connection_status("Detectando token do Discord no sistema...".into());
+            }
+        });
+
+        tokio::spawn(async move {
+            let candidates = auto_detect_discord_tokens();
+            if candidates.is_empty() {
+                let app_w_ui = app_w.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = app_w_ui.upgrade() {
+                        ui.set_connection_status("Nenhum token do Discord foi encontrado no sistema.".into());
+                    }
+                });
+            } else {
+                let success = try_login_with_candidates(
+                    candidates,
+                    app_w.clone(),
+                    http_client_inner,
+                    last_token_inner,
+                    guilds_map_inner,
+                    active_g_inner,
+                    active_c_inner,
+                    cmd_tx_inner,
+                    event_tx_gw,
+                ).await;
+
+                if !success {
+                    let app_w_ui = app_w.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = app_w_ui.upgrade() {
+                            let net = crate::utils::get_network_settings();
+                            if net.proxy_mode != "off" {
+                                ui.set_connection_status(crate::utils::i18n_ui::ui_text().proxy_failed.replace("{}", &net.proxy_mode.to_uppercase()).into());
+                                ui.set_login_alert_message(crate::utils::format_proxy_alert_message().into());
+                                ui.set_login_alert_is_error(true);
+                            } else {
+                                ui.set_connection_status("Nenhum dos tokens encontrados foi aceito pelo Discord.".into());
+                            }
+                        }
+                    });
+                }
+            }
+        });
+    });
+
+    // Proactive Proxy Health Check at Startup
+    let app_weak_proxy_check = app_weak.clone();
+    tokio::spawn(async move {
+        let net = crate::utils::get_network_settings();
+        if net.proxy_mode != "off" {
+            info!("🌐 Verificando conectividade do proxy configurado ({}: {}:{})...", net.proxy_mode, net.proxy_host, net.proxy_port);
+            if let Err(e) = crate::utils::test_proxy_connection().await {
+                warn!("⚠️ Proxy ativo ({}) inacessível no início da aplicação: {}", net.proxy_mode, e);
+                let proxy_msg = crate::utils::format_proxy_alert_message();
+                let app_w = app_weak_proxy_check.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = app_w.upgrade() {
+                        if !ui.get_is_logged_in() {
+                            ui.set_login_alert_message(proxy_msg.into());
+                            ui.set_login_alert_is_error(true);
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    // Auto-Login if saved token file exists or if auto-detectable from Discord Desktop
+    let event_tx_startup = event_tx.clone();
+    let app_weak_startup = app_weak.clone();
+    let http_client_startup = Arc::clone(&http_client);
+    let last_token_startup = Arc::clone(&last_token);
+    let guilds_map_startup = Arc::clone(&guilds_map);
+    let active_guild_startup = Arc::clone(&active_guild_id);
+    let active_channel_startup = Arc::clone(&active_channel_id);
+    let cmd_tx_startup = Arc::clone(&cmd_tx_store);
+    let qr_tx_startup = qr_tx.clone();
+    let active_qr_startup = Arc::clone(&active_qr_session);
+
+    tokio::spawn(async move {
+        let vault = load_account_vault();
+        sync_ui_saved_accounts(&app_weak_startup, &vault);
+        let saved_opt = load_secure_token();
+
+        if let Some(saved) = saved_opt {
+            let app_w_status = app_weak_startup.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = app_w_status.upgrade() {
+                    ui.set_connection_status(crate::utils::i18n_ui::ui_text().auto_connecting.into());
+                }
+            });
+
+            let success = try_login_with_candidates(
+                vec![saved],
+                app_weak_startup.clone(),
+                http_client_startup,
+                last_token_startup,
+                guilds_map_startup,
+                active_guild_startup,
+                active_channel_startup,
+                cmd_tx_startup,
+                event_tx_startup,
+            ).await;
+
+            if !success {
+                delete_secure_token();
+                let session = remote_auth::RemoteAuthSession::start(qr_tx_startup.clone());
+                *active_qr_startup.lock().unwrap() = Some(session);
+            }
+        } else {
+            // No saved token (e.g. fresh install or after explicit logout): start QR session immediately!
+            info!("No token saved to disk. Starting QR Code session...");
+            let session = remote_auth::RemoteAuthSession::start(qr_tx_startup.clone());
+            *active_qr_startup.lock().unwrap() = Some(session);
+        }
+    });
+
+
+
+    // Select Guild Callback
+    let guilds_map_select = Arc::clone(&guilds_map);
+    let active_guild_select = Arc::clone(&active_guild_id);
+    let app_weak_guild_select = app_weak.clone();
+    let http_client_guild_select = Arc::clone(&http_client);
+    let active_channel_guild_select = Arc::clone(&active_channel_id);
+    let cmd_tx_guild_select = Arc::clone(&cmd_tx_store);
+
+    app.on_select_guild(move |guild_id: SharedString| {
+        let gid = guild_id.to_string();
+        info!("Servidor selecionado pelo usuário: {}", gid);
+
+        if let Some(ui) = app_weak_guild_select.upgrade() {
+            ui.set_is_voice_focused(false);
+        }
+
+        if let Some(tx) = cmd_tx_guild_select.lock().unwrap().as_ref() {
+            let _ = tx.try_send(GatewayCommand::SubscribeGuild { guild_id: gid.clone(), channel_ids: Vec::new() });
+        }
+
+        let http_opt = http_client_guild_select.lock().unwrap().as_ref().cloned();
+        let app_w = app_weak_guild_select.clone();
+        let guilds_map_in = Arc::clone(&guilds_map_select);
+        let active_g_in = Arc::clone(&active_guild_select);
+        let active_c_in = Arc::clone(&active_channel_guild_select);
+        let cmd_tx_in = Arc::clone(&cmd_tx_guild_select);
+
+        if let Some(http) = http_opt {
+            tokio::spawn(async move {
+                if gid == "@me" {
+                    fetch_and_populate_dms(
+                        &http,
+                        app_w,
+                        guilds_map_in,
+                        active_g_in,
+                        active_c_in,
+                    ).await;
+                } else {
+                    if let Some(tx) = cmd_tx_in.lock().unwrap().as_ref() {
+                        let _ = tx.try_send(GatewayCommand::SubscribeGuild { guild_id: gid.clone(), channel_ids: Vec::new() });
+                    }
+                    fetch_and_populate_channels(
+                        &http,
+                        app_w,
+                        guilds_map_in,
+                        active_g_in,
+                        active_c_in,
+                        cmd_tx_in,
+                        &gid,
+                    ).await;
+                }
+            });
+        }
+    });
+
+    // Select Channel Callback
+    let guilds_map_chan_select = Arc::clone(&guilds_map);
+    let active_guild_chan_select = Arc::clone(&active_guild_id);
+    let active_channel_chan_select = Arc::clone(&active_channel_id);
+    let app_weak_chan_select = app_weak.clone();
+    let http_client_chan_select = Arc::clone(&http_client);
+    let cmd_tx_chan_select = Arc::clone(&cmd_tx_store);
+    let selected_input_voice = Arc::clone(&selected_input);
+    let active_mic_stream_voice = Arc::clone(&active_mic_stream);
+    let level_tx_voice = level_tx.clone();
+    // Toggle Channel Category Collapsed/Expanded State Callback
+    let app_weak_toggle_cat = app_weak.clone();
+    let guilds_map_toggle_cat = Arc::clone(&guilds_map);
+    let active_guild_toggle_cat = Arc::clone(&active_guild_id);
+
+    app.on_toggle_category(move |cat_id_str: SharedString| {
+        let cat_id = cat_id_str.to_string();
+        info!("Alternando estado da categoria de canais: {}", cat_id);
+        let cats_store = get_collapsed_categories();
+        {
+            let mut cats_guard = cats_store.lock().unwrap();
+            if cats_guard.contains(&cat_id) {
+                cats_guard.remove(&cat_id);
+            } else {
+                cats_guard.insert(cat_id);
+            }
+        }
+
+        let gid = active_guild_toggle_cat.lock().unwrap().clone();
+        if let Ok(map) = guilds_map_toggle_cat.lock() {
+            if let Some(g_data) = map.get(&gid) {
+                let cats_guard = cats_store.lock().unwrap().clone();
+                let ui_channels = build_ui_channels(&g_data.channels, &cats_guard);
+                let app_w = app_weak_toggle_cat.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = app_w.upgrade() {
+                        let model = std::rc::Rc::new(slint::VecModel::from(ui_channels));
+                        ui.set_channels(model.into());
+                    }
+                });
+            }
+        }
+    });
+
+    // Reorder Guild Callback
+    let app_weak_reorder_g = app_weak.clone();
+    app.on_reorder_guild(move |from_idx: i32, to_idx: i32| {
+        let from = from_idx as usize;
+        let to = to_idx as usize;
+        if let Some(ui) = app_weak_reorder_g.upgrade() {
+            let guilds_model = ui.get_guilds();
+            let count = guilds_model.row_count();
+            if from < count && to < count && from != to {
+                let mut list = Vec::new();
+                for i in 0..count {
+                    if let Some(item) = guilds_model.row_data(i) {
+                        list.push(item);
+                    }
+                }
+                let item = list.remove(from);
+                list.insert(to, item);
+                let order_ids: Vec<String> = list.iter().map(|g| g.id.to_string()).collect();
+                if let Ok(json) = serde_json::to_string_pretty(&order_ids) {
+                    let _ = std::fs::write(".kiyora_guild_order.json", json);
+                }
+                ui.set_guilds(std::rc::Rc::new(slint::VecModel::from(list)).into());
+                info!("🔄 Servidores reordenados de {} para {} e persistidos em .kiyora_guild_order.json", from, to);
+            }
+        }
+    });
+
+    let app_weak_drop_row = app_weak.clone();
+    app.on_channel_drop_row(move |from, dy| {
+        let Some(ui) = app_weak_drop_row.upgrade() else { return from };
+        let rows: Vec<ChannelItem> = ui.get_channels().iter().collect();
+        crate::ui::helpers::channel_drop_row(&rows, from.max(0) as usize, dy) as i32
+    });
+
+    // Reorder Channel Callback
+    let app_weak_reorder_c = app_weak.clone();
+    let guilds_map_reorder_c = Arc::clone(&guilds_map);
+    let active_guild_reorder_c = Arc::clone(&active_guild_id);
+    app.on_reorder_channel(move |from_idx: i32, to_idx: i32| {
+        let from = from_idx as usize;
+        let to = to_idx as usize;
+        let gid = active_guild_reorder_c.lock().unwrap().clone();
+        if gid.is_empty() || gid == "@me" { return; }
+        // The indices are rows of the sidebar, which leaves out the channels of collapsed
+        // categories: find the channels by id, not by position.
+        let Some(ui) = app_weak_reorder_c.upgrade() else { return };
+        let rows = ui.get_channels();
+        let (Some(from_row), Some(to_row)) = (rows.row_data(from), rows.row_data(to)) else { return };
+
+        if let Ok(mut map) = guilds_map_reorder_c.lock() {
+            if let Some(g_data) = map.get_mut(&gid) {
+                let from = g_data.channels.iter().position(|c| c.id == from_row.id.as_str()).unwrap_or(usize::MAX);
+                let to = g_data.channels.iter().position(|c| c.id == to_row.id.as_str()).unwrap_or(usize::MAX);
+                if from < g_data.channels.len() && to < g_data.channels.len() && from != to {
+                    let item = g_data.channels.remove(from);
+                    g_data.channels.insert(to, item);
+                    let order_ids: Vec<String> = g_data.channels.iter().map(|c| c.id.clone()).collect();
+                    if let Ok(json) = serde_json::to_string_pretty(&order_ids) {
+                        let _ = std::fs::write(format!(".kiyora_channel_order_{}.json", gid), json);
+                    }
+                    let cats_guard = get_collapsed_categories().lock().unwrap().clone();
+                    let ui_channels = build_ui_channels(&g_data.channels, &cats_guard);
+                    if let Some(ui) = app_weak_reorder_c.upgrade() {
+                        ui.set_channels(std::rc::Rc::new(slint::VecModel::from(ui_channels)).into());
+                    }
+                    info!("🔄 Canais do servidor {} reordenados e persistidos localmente!", gid);
+                }
+            }
+        }
+    });
+
+    let sm_chan_select = Arc::clone(&screen_manager);
+
+    app.on_select_channel(move |channel_id: SharedString| {
+        let ch_id = channel_id.to_string();
+        info!("Canal selecionado pelo usuário: {}", ch_id);
+        *active_channel_chan_select.lock().unwrap() = ch_id.clone();
+
+        let gid = active_guild_chan_select.lock().unwrap().clone();
+        let target_channel = guilds_map_chan_select.lock().unwrap()
+            .get(&gid)
+            .and_then(|g| g.channels.iter().find(|c| c.id == ch_id).cloned());
+
+        let is_voice = target_channel.as_ref().map(|c| c.is_voice).unwrap_or(false);
+        let ch_name = target_channel.as_ref().map(|c| c.name.clone()).unwrap_or_else(|| "canal".to_string());
+
+        if let Some(ui) = app_weak_chan_select.upgrade() {
+            if is_voice {
+                ui.set_is_in_voice(true);
+                ui.set_is_voice_connecting(true);
+                ui.set_is_voice_focused(true);
+                ui.set_current_voice_channel(ch_name.clone().into());
+                sound_effects::play_ui_sound(sound_effects::UiSound::JoinChannel);
+                gateway::sync_voice_channel_participants(&ch_id);
+                let muted = ui.get_is_muted();
+                let deafened = ui.get_is_deafened();
+
+                let cid_num = ch_id.parse::<u64>().unwrap_or(0);
+                let my_uid = gateway::get_my_user_id();
+                let my_uname = gateway::get_my_username();
+                if my_uid > 0 {
+                    if let Ok(mut gvs) = gateway::get_guild_voice_states_store().lock() {
+                        gvs.insert(my_uid, ch_id.clone());
+                    }
+                }
+                sm_chan_select.set_context(cid_num, my_uid, &my_uname);
+                sm_chan_select.announce_presence();
+
+                // 1. Send Opcode 4 VoiceStateUpdate to Discord Gateway WebSocket!
+                if let Some(cmd_tx_guard) = cmd_tx_chan_select.lock().unwrap().as_ref() {
+                    let _ = cmd_tx_guard.try_send(GatewayCommand::UpdateVoiceState {
+                        guild_id: gid.clone(),
+                        channel_id: Some(ch_id.clone()),
+                        self_mute: muted,
+                        self_deaf: deafened,
+                    });
+                }
+
+
+                // 3. Auto-start microphone capture for voice channel (feeds PCM to gateway queue)
+                let mic_name = selected_input_voice.lock().unwrap().clone();
+                *active_mic_stream_voice.lock().unwrap() = Some(start_mic_capture(mic_name, level_tx_voice.clone()));
+                info!("Opening microphone for the voice channel...");
+                
+                let mut current_msgs: Vec<ChatMessage> = ui.get_messages().iter().collect();
+                current_msgs.push(ChatMessage {
+                    id: "".into(),
+                    author: "kiyora Voice".into(),
+                    content: format!("🔊 Entrou no canal de voz: {}", ch_name).into(),
+                    commands: slint::ModelRc::default(),
+                    content_lines: slint::ModelRc::default(),
+                    embed_content: "".into(),
+                    embed_lines: slint::ModelRc::default(),
+                    embed_color: slint::Color::from_rgb_u8(88, 101, 242),
+                    embed_footer: "".into(),
+                    code_block: "".into(),
+                    reply_author: "".into(),
+                    reply_content: "".into(),
+                    reply_command: "".into(),
+                    links: slint::ModelRc::default(),
+                    buttons: slint::ModelRc::default(),
+                    attachments: slint::ModelRc::default(),
+                    timestamp: crate::utils::i18n_ui::ui_text().now_label.into(),
+                    show_header: true,
+                    ..Default::default()
+                });
+                let model = std::rc::Rc::new(slint::VecModel::from(current_msgs));
+                ui.set_messages(model.into());
+            } else {
+                let clean_name = crate::utils::styled_text::plain_display_name(ch_name.trim_start_matches('#').trim());
+                ui.set_active_channel_name(clean_name.as_ref().into());
+                ui.set_active_channel_id(ch_id.clone().into());
+                ui.set_is_voice_focused(false);
+                request_chat_scroll_to_bottom(app_weak_chan_select.clone());
+
+                // Zera o badge de não lidos do canal que foi aberto
+                let mut channels: Vec<ChannelItem> = ui.get_channels().iter().collect();
+                if let Some(ch) = channels.iter_mut().find(|c| c.id == ch_id.as_str()) {
+                    ch.unread_count = 0;
+                }
+                let model = std::rc::Rc::new(slint::VecModel::from(channels));
+                ui.set_channels(model.into());
+
+                // Zera o unread deste canal no mapa global de DMs e atualiza o badge do botão principal de DMs
+                let remaining_dm_unreads = crate::ui::helpers::clear_dm_unread(&ch_id);
+                ui.set_total_dm_unread_count(remaining_dm_unreads);
+
+                let http_opt = http_client_chan_select.lock().unwrap().as_ref().cloned();
+                let app_w = app_weak_chan_select.clone();
+                let ch_id_clone = ch_id.clone();
+
+                if let Some(http) = http_opt {
+                    tokio::spawn(async move {
+                        load_messages_for_channel(&http, app_w, &ch_id_clone).await;
+                    });
+                }
+            }
+        }
+    });
+
+    // Mute Button Toggle Callback
+    let cmd_tx_mute = Arc::clone(&cmd_tx_store);
+    let active_guild_mute = Arc::clone(&active_guild_id);
+    let active_channel_mute = Arc::clone(&active_channel_id);
+    let app_weak_mute = app_weak.clone();
+
+    app.on_toggle_mute(move || {
+        if let Some(ui) = app_weak_mute.upgrade() {
+            let new_muted = !ui.get_is_muted();
+            ui.set_is_muted(new_muted);
+            sound_effects::play_ui_sound(if new_muted {
+                sound_effects::UiSound::Mute
+            } else {
+                sound_effects::UiSound::Unmute
+            });
+
+            let gid = active_guild_mute.lock().unwrap().clone();
+            let cid = active_channel_mute.lock().unwrap().clone();
+            let deafened = ui.get_is_deafened();
+
+            if let Some(cmd_tx_guard) = cmd_tx_mute.lock().unwrap().as_ref() {
+                let _ = cmd_tx_guard.try_send(GatewayCommand::UpdateVoiceState {
+                    guild_id: gid,
+                    channel_id: Some(cid),
+                    self_mute: new_muted,
+                    self_deaf: deafened,
+                });
+            }
+        }
+    });
+
+    // Deafen Button Toggle Callback
+    let cmd_tx_deafen = Arc::clone(&cmd_tx_store);
+    let active_guild_deafen = Arc::clone(&active_guild_id);
+    let active_channel_deafen = Arc::clone(&active_channel_id);
+    let app_weak_deafen = app_weak.clone();
+
+    app.on_toggle_deafen(move || {
+        if let Some(ui) = app_weak_deafen.upgrade() {
+            let new_deafened = !ui.get_is_deafened();
+            ui.set_is_deafened(new_deafened);
+            gateway::set_self_deaf(new_deafened);
+            sound_effects::play_ui_sound(if new_deafened {
+                sound_effects::UiSound::Deafen
+            } else {
+                sound_effects::UiSound::Undeafen
+            });
+
+            let gid = active_guild_deafen.lock().unwrap().clone();
+            let cid = active_channel_deafen.lock().unwrap().clone();
+            let muted = ui.get_is_muted();
+
+            if let Some(cmd_tx_guard) = cmd_tx_deafen.lock().unwrap().as_ref() {
+                let _ = cmd_tx_guard.try_send(GatewayCommand::UpdateVoiceState {
+                    guild_id: gid,
+                    channel_id: Some(cid),
+                    self_mute: muted,
+                    self_deaf: new_deafened,
+                });
+            }
+        }
+    });
+
+    // Start Global Keybinds Listener (Global shortcuts for Mute/Deafen)
+    let app_weak_kb_mute = app_weak.clone();
+    let cmd_tx_kb_mute = Arc::clone(&cmd_tx_store);
+    let active_guild_kb_mute = Arc::clone(&active_guild_id);
+    let active_channel_kb_mute = Arc::clone(&active_channel_id);
+
+    let app_weak_kb_deaf = app_weak.clone();
+    let cmd_tx_kb_deaf = Arc::clone(&cmd_tx_store);
+    let active_guild_kb_deaf = Arc::clone(&active_guild_id);
+    let active_channel_kb_deaf = Arc::clone(&active_channel_id);
+
+    let app_weak_kb_rec = app_weak.clone();
+
+    keybind_mgr.start_global_listener(
+        move || {
+            let app_w = app_weak_kb_mute.clone();
+            let cmd_tx = Arc::clone(&cmd_tx_kb_mute);
+            let agid = Arc::clone(&active_guild_kb_mute);
+            let acid = Arc::clone(&active_channel_kb_mute);
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = app_w.upgrade() {
+                    let new_muted = !ui.get_is_muted();
+                    ui.set_is_muted(new_muted);
+                    sound_effects::play_ui_sound(if new_muted {
+                        sound_effects::UiSound::Mute
+                    } else {
+                        sound_effects::UiSound::Unmute
+                    });
+
+                    let gid = agid.lock().unwrap().clone();
+                    let cid = acid.lock().unwrap().clone();
+                    let deafened = ui.get_is_deafened();
+
+                    if let Some(cmd_tx_guard) = cmd_tx.lock().unwrap().as_ref() {
+                        let _ = cmd_tx_guard.try_send(GatewayCommand::UpdateVoiceState {
+                            guild_id: gid,
+                            channel_id: Some(cid),
+                            self_mute: new_muted,
+                            self_deaf: deafened,
+                        });
+                    }
+                }
+            });
+        },
+        move || {
+            let app_w = app_weak_kb_deaf.clone();
+            let cmd_tx = Arc::clone(&cmd_tx_kb_deaf);
+            let agid = Arc::clone(&active_guild_kb_deaf);
+            let acid = Arc::clone(&active_channel_kb_deaf);
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = app_w.upgrade() {
+                    let new_deafened = !ui.get_is_deafened();
+                    ui.set_is_deafened(new_deafened);
+                    gateway::set_self_deaf(new_deafened);
+                    sound_effects::play_ui_sound(if new_deafened {
+                        sound_effects::UiSound::Deafen
+                    } else {
+                        sound_effects::UiSound::Undeafen
+                    });
+
+                    let gid = agid.lock().unwrap().clone();
+                    let cid = acid.lock().unwrap().clone();
+                    let muted = ui.get_is_muted();
+
+                    if let Some(cmd_tx_guard) = cmd_tx.lock().unwrap().as_ref() {
+                        let _ = cmd_tx_guard.try_send(GatewayCommand::UpdateVoiceState {
+                            guild_id: gid,
+                            channel_id: Some(cid),
+                            self_mute: muted,
+                            self_deaf: new_deafened,
+                        });
+                    }
+                }
+            });
+        },
+        move |target: u8, combo: String| {
+            let app_w = app_weak_kb_rec.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = app_w.upgrade() {
+                    if target == 1 && !combo.is_empty() {
+                        ui.set_keybind_mute_str(combo.into());
+                    } else if target == 2 && !combo.is_empty() {
+                        ui.set_keybind_deafen_str(combo.into());
+                    }
+                    ui.set_recording_keybind_for(0);
+                }
+            });
+        },
+    );
+
+    // Send Message Callback from UI
+    let http_client_msg = Arc::clone(&http_client);
+    let active_channel_msg = Arc::clone(&active_channel_id);
+    app.on_send_message(move |content: SharedString| {
+        let content_str = content.to_string();
+        let channel_id = active_channel_msg.lock().unwrap().clone();
+        let http_opt = http_client_msg.lock().unwrap().as_ref().cloned();
+
+        if let Some(http) = http_opt {
+            tokio::spawn(async move {
+                let _ = http.send_message(&channel_id, &content_str).await;
+            });
+        }
+    });
+
+    // Click Command Callback (fills input with command parameter pill)
+    let app_weak_cmd = app_weak.clone();
+    app.on_click_command(move |cmd: SharedString| {
+        if let Some(ui) = app_weak_cmd.upgrade() {
+            let cmd_str = cmd.to_string();
+            let clean_cmd = if cmd_str.starts_with('/') { cmd_str } else { format!("/{}", cmd_str) };
+            
+            let master = get_master_command_suggestions().lock().unwrap().clone();
+            if let Some(found) = master.iter().find(|s| s.name.to_lowercase() == clean_cmd.to_lowercase()) {
+                ui.set_active_command_name(found.name.clone().into());
+                ui.set_active_param_name(found.param_name.clone().into());
+                let pdesc = if found.param_desc.is_empty() {
+                    if found.param_name.is_empty() { format!("Pressione Enter para executar {}", found.name) } else { found.desc.clone() }
+                } else {
+                    found.param_desc.clone()
+                };
+                ui.set_active_param_desc(pdesc.into());
+                ui.set_active_command_app_id(found.app_id.clone().into());
+                ui.set_active_command_cmd_id(found.cmd_id.clone().into());
+                ui.set_active_command_version(found.version.clone().into());
+            } else {
+                ui.set_active_command_name(clean_cmd.clone().into());
+                ui.set_active_param_name("".into());
+                ui.set_active_param_desc(format!("Pressione Enter para executar {}", clean_cmd).into());
+                ui.set_active_command_app_id("".into());
+                ui.set_active_command_cmd_id("".into());
+                ui.set_active_command_version("".into());
+            }
+            ui.set_command_arg_text("".into());
+            ui.set_chat_input_text("".into());
+            ui.set_show_command_suggestions(false);
+        }
+    });
+
+    // Handle Input Change Callback (ranked real-time autocomplete filtering)
+    let app_weak_inp = app_weak.clone();
+    app.on_handle_input_change(move |text: SharedString| {
+        if let Some(ui) = app_weak_inp.upgrade() {
+            let t = text.to_string();
+            let trimmed = t.trim();
+            if trimmed.starts_with('/') {
+                let query = trimmed.to_lowercase();
+                let master = get_master_command_suggestions().lock().unwrap().clone();
+                
+                // If user typed "/play " (with trailing space and matched a command):
+                if t.ends_with(' ') && t.starts_with('/') {
+                    let cmd_word = t.trim();
+                    if let Some(found) = master.iter().find(|c| c.name.to_lowercase() == cmd_word.to_lowercase()) {
+                        ui.set_active_command_name(found.name.clone().into());
+                        ui.set_active_param_name(found.param_name.clone().into());
+                        let pdesc = if found.param_desc.is_empty() {
+                            if found.param_name.is_empty() { format!("Pressione Enter para executar {}", found.name) } else { found.desc.clone() }
+                        } else {
+                            found.param_desc.clone()
+                        };
+                        ui.set_active_param_desc(pdesc.into());
+                        ui.set_active_command_app_id(found.app_id.clone().into());
+                        ui.set_active_command_cmd_id(found.cmd_id.clone().into());
+                        ui.set_active_command_version(found.version.clone().into());
+                        ui.set_command_arg_text("".into());
+                        ui.set_chat_input_text("".into());
+                        ui.set_show_command_suggestions(false);
+                        return;
+                    }
+                }
+
+                let mut scored: Vec<(i32, CommandSuggestionItem)> = master.into_iter().filter_map(|cmd| {
+                    let name_lower = cmd.name.to_lowercase();
+                    let desc_lower = cmd.desc.to_lowercase();
+                    let app_lower = cmd.app_name.to_lowercase();
+                    
+                    if name_lower == query {
+                        Some((1000, cmd))
+                    } else if name_lower.starts_with(&query) {
+                        Some((500 - (name_lower.len() as i32), cmd))
+                    } else if name_lower.contains(&query) {
+                        Some((200, cmd))
+                    } else if app_lower.contains(&query.trim_start_matches('/')) {
+                        Some((150, cmd))
+                    } else if desc_lower.contains(&query.trim_start_matches('/')) {
+                        Some((100, cmd))
+                    } else if query == "/" {
+                        Some((50, cmd))
+                    } else {
+                        None
+                    }
+                }).collect();
+
+                scored.sort_by(|a, b| b.0.cmp(&a.0));
+
+                let filtered_suggestions: Vec<CommandSuggestion> = scored.into_iter().map(|(_, item)| CommandSuggestion {
+                    name: item.name.into(),
+                    desc: item.desc.into(),
+                    usage: item.usage.into(),
+                    app_id: item.app_id.into(),
+                    app_name: item.app_name.into(),
+                    cmd_id: item.cmd_id.into(),
+                    version: item.version.into(),
+                    param_name: item.param_name.into(),
+                    param_desc: item.param_desc.into(),
+                    is_required: item.is_required,
+                }).collect();
+
+                let is_empty = filtered_suggestions.is_empty();
+                let model = std::rc::Rc::new(slint::VecModel::from(filtered_suggestions));
+                ui.set_command_suggestions(model.into());
+                ui.set_show_command_suggestions(!is_empty);
+            } else {
+                ui.set_show_command_suggestions(false);
+            }
+        }
+    });
+
+    // Execute Active Command Callback (Discord Slash Command interaction or text message fallback)
+    let http_client_cmd = Arc::clone(&http_client);
+    let active_channel_cmd = Arc::clone(&active_channel_id);
+    let active_guild_cmd = Arc::clone(&active_guild_id);
+    app.on_execute_active_command(move |cmd_name: SharedString, arg_value: SharedString, app_id: SharedString, cmd_id: SharedString, version: SharedString, param_name: SharedString| {
+        let cmd_name_str = cmd_name.to_string();
+        let arg_val_str = arg_value.to_string();
+        let app_id_str = app_id.to_string();
+        let cmd_id_str = cmd_id.to_string();
+        let version_str = version.to_string();
+        let param_name_str = param_name.to_string();
+        
+        let channel_id = active_channel_cmd.lock().unwrap().clone();
+        let guild_id = active_guild_cmd.lock().unwrap().clone();
+        let http_opt = http_client_cmd.lock().unwrap().as_ref().cloned();
+
+        if let Some(http) = http_opt {
+            tokio::spawn(async move {
+                let clean_name = cmd_name_str.trim_start_matches('/').to_string();
+                if !app_id_str.is_empty() && !cmd_id_str.is_empty() {
+                    let mut options = Vec::new();
+                    if !arg_val_str.is_empty() {
+                        let opt_name = if param_name_str.is_empty() { "query".to_string() } else { param_name_str };
+                        options.push(serde_json::json!({
+                            "type": 3,
+                            "name": opt_name,
+                            "value": arg_val_str
+                        }));
+                    }
+                    if let Err(e) = http.send_slash_command_interaction(
+                        &guild_id,
+                        &channel_id,
+                        &app_id_str,
+                        &cmd_id_str,
+                        &clean_name,
+                        &version_str,
+                        options,
+                        ""
+                    ).await {
+                        warn!("Failed to send slash command interaction (trying fallback): {}", e);
+                        let fallback_msg = if arg_val_str.is_empty() {
+                            format!("/{}", clean_name)
+                        } else {
+                            format!("/{} {}", clean_name, arg_val_str)
+                        };
+                        let _ = http.send_message(&channel_id, &fallback_msg).await;
+                    }
+                } else {
+                    let fallback_msg = if arg_val_str.is_empty() {
+                        cmd_name_str
+                    } else {
+                        format!("{} {}", cmd_name_str, arg_val_str)
+                    };
+                    let _ = http.send_message(&channel_id, &fallback_msg).await;
+                }
+            });
+        }
+    });
+
+    // Minimize to Tray Callback using Win32 ShowWindow(SW_HIDE)
+    let app_weak_tray_min = app_weak.clone();
+    let hwnd_store_minimize = Arc::clone(&hwnd_store);
+    app.on_minimize_to_tray(move || {
+        info!("Minimizando janela para a bandeja do sistema via Win32 SW_HIDE...");
+        crate::ui::window_place::save_now();
+        crate::ui::invite_cards::clear();
+        APP_IS_VISIBLE.store(false, Ordering::Relaxed);
+        PENDING_MESSAGES.store(0, Ordering::Relaxed);
+        info!("[DeepSleep] UI loops suspensos. Apenas áudio permanece ativo.");
+        let app_w = app_weak_tray_min.clone();
+        let hwnd_store_c = Arc::clone(&hwnd_store_minimize);
+        slint::Timer::single_shot(std::time::Duration::from_millis(50), move || {
+            let mut target_hwnd = *hwnd_store_c.lock().unwrap();
+            if let Some(ui) = app_w.upgrade() {
+                use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                let _ = ui.window().with_winit_window(|winit_win| {
+                    winit_win.set_visible(false);
+                    if target_hwnd.is_none() {
+                        if let Ok(handle) = winit_win.window_handle() {
+                            if let RawWindowHandle::Win32(win32_handle) = handle.as_raw() {
+                                target_hwnd = Some(win32_handle.hwnd.get() as isize);
+                            }
+                        }
+                    }
+                });
+            }
+            #[cfg(target_os = "windows")]
+            if let Some(hwnd) = target_hwnd {
+                unsafe {
+                    ShowWindow(hwnd as _, SW_HIDE);
+                }
+            }
+            trim_process_memory();
+            info!("[DeepSleep] Memória RAM compactada e liberada (minimize to tray)!");
+        });
+    });
+
+    // Custom window controls for frameless mode
+    let app_weak_drag = app_weak.clone();
+    static LAST_DRAG_TS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    app.on_drag_window(move || {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let last = LAST_DRAG_TS.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < 250 {
+            return;
+        }
+        LAST_DRAG_TS.store(now, Ordering::Relaxed);
+        if let Some(app_instance) = app_weak_drag.upgrade() {
+            app_instance.set_drag_area_enabled(false);
+            let _ = app_instance.window().with_winit_window(|winit_window| {
+                let _ = winit_window.drag_window();
+            });
+            let app_w = app_weak_drag.clone();
+            slint::Timer::single_shot(std::time::Duration::from_millis(150), move || {
+                if let Some(app_inst) = app_w.upgrade() {
+                    app_inst.set_drag_area_enabled(true);
+                }
+            });
+        }
+    });
+
+    let app_weak_resize = app_weak.clone();
+    app.on_drag_resize(move |edge: SharedString| {
+        if let Some(app_instance) = app_weak_resize.upgrade() {
+            app_instance.set_drag_area_enabled(false);
+            let _ = app_instance.window().with_winit_window(|winit_window| {
+                let dir = match edge.as_str() {
+                    "top" => winit::window::ResizeDirection::North,
+                    "bottom" => winit::window::ResizeDirection::South,
+                    "left" => winit::window::ResizeDirection::West,
+                    "right" => winit::window::ResizeDirection::East,
+                    "top-left" => winit::window::ResizeDirection::NorthWest,
+                    "top-right" => winit::window::ResizeDirection::NorthEast,
+                    "bottom-left" => winit::window::ResizeDirection::SouthWest,
+                    "bottom-right" => winit::window::ResizeDirection::SouthEast,
+                    _ => return,
+                };
+                let _ = winit_window.drag_resize_window(dir);
+            });
+            let app_w = app_weak_resize.clone();
+            slint::Timer::single_shot(std::time::Duration::from_millis(150), move || {
+                if let Some(app_inst) = app_w.upgrade() {
+                    app_inst.set_drag_area_enabled(true);
+                }
+            });
+        }
+    });
+
+    let app_weak_min = app_weak.clone();
+    let hwnd_store_min = Arc::clone(&hwnd_store);
+    app.on_minimize_window(move || {
+        info!("🔕 Minimizando janela para a bandeja do sistema (System Tray) & entrando em DeepSleep...");
+        APP_IS_VISIBLE.store(false, Ordering::Relaxed);
+        PENDING_MESSAGES.store(0, Ordering::Relaxed);
+        info!("[DeepSleep] UI loops suspensos. Apenas áudio permanece ativo.");
+        let app_w = app_weak_min.clone();
+        let hwnd_store_c = Arc::clone(&hwnd_store_min);
+        slint::Timer::single_shot(std::time::Duration::from_millis(50), move || {
+            let mut target_hwnd = *hwnd_store_c.lock().unwrap();
+            if let Some(ui) = app_w.upgrade() {
+                use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                let _ = ui.window().with_winit_window(|winit_win| {
+                    winit_win.set_visible(false);
+                    winit_win.set_minimized(true);
+                    if target_hwnd.is_none() {
+                        if let Ok(handle) = winit_win.window_handle() {
+                            if let RawWindowHandle::Win32(win32_handle) = handle.as_raw() {
+                                target_hwnd = Some(win32_handle.hwnd.get() as isize);
+                            }
+                        }
+                    }
+                });
+            }
+            #[cfg(target_os = "windows")]
+            if let Some(hwnd) = target_hwnd {
+                unsafe {
+                    ShowWindow(hwnd as _, SW_HIDE);
+                }
+            }
+            trim_process_memory();
+            info!("[DeepSleep] Memória RAM compactada e liberada ao minimizar!");
+        });
+    });
+
+    let app_weak_max = app_weak.clone();
+    app.on_maximize_window(move || {
+        if let Some(app_instance) = app_weak_max.upgrade() {
+            let is_max = app_instance.window().is_maximized();
+            let next = !is_max;
+            app_instance.window().set_maximized(next);
+            app_instance.set_is_maximized(next);
+        }
+    });
+
+    let sm_for_close = Arc::clone(&screen_manager);
+    app.on_close_window(move || {
+        info!("Fechar clicado na barra superior: saindo do aplicativo...");
+        crate::ui::window_place::save_now();
+        sm_for_close.stop();
+        #[cfg(target_os = "linux")]
+        screen_capture::kill_portal_child();
+        std::process::exit(0);
+    });
+
+    // Handle Gateway Events in Tokio Task and Dispatch to Slint UI Thread
+    let app_weak_gw_events = app_weak.clone();
+    let active_guild_gw_events = Arc::clone(&active_guild_id);
+    let active_channel_gw_events = Arc::clone(&active_channel_id);
+    let guilds_map_gw_events = Arc::clone(&guilds_map);
+    let sm_gw = Arc::clone(&screen_manager);
+    let active_mic_disc = Arc::clone(&active_mic_stream);
+
+    tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            let app_weak_inner = app_weak_gw_events.clone();
+            let active_guild_inner = Arc::clone(&active_guild_gw_events);
+            let active_channel_inner = Arc::clone(&active_channel_gw_events);
+            let guilds_map_inner = Arc::clone(&guilds_map_gw_events);
+            let sm_gw_inner = Arc::clone(&sm_gw);
+
+            match event {
+                GatewayEvent::VoiceDisconnected => {
+                    sound_effects::play_ui_sound(sound_effects::UiSound::LeaveChannel);
+                    let app_w = app_weak.clone();
+                    let sm_disc = Arc::clone(&sm_gw_inner);
+                    *active_mic_disc.lock().unwrap() = None;
+                    let _ = slint::invoke_from_event_loop(move || {
+                        sm_disc.stop();
+                        sm_disc.set_context(0, 0, "");
+                        screen_capture::clear_stream_audio_queue();
+                        if let Some(ui) = app_w.upgrade() {
+                            info!("🚪 Desconectando UI do canal de voz (sessão encerrada/deslocada por outro cliente)");
+                            ui.set_is_in_voice(false);
+                            ui.set_is_voice_connecting(false);
+                            ui.set_is_screen_sharing(false);
+                            ui.set_has_active_stream(false);
+                            ui.set_popped_out_stream_uid("".into());
+                            ui.set_voice_participants(slint::ModelRc::new(slint::VecModel::from(vec![])));
+                        }
+                    });
+                }
+                GatewayEvent::Connected { user_tag } => {
+                    // One trim once the first screens have loaded after login: the startup
+                    // pages (parsing READY, first layout) are not touched again. Not repeated
+                    // periodically, since pages in use would only fault back in.
+                    tokio::spawn(async {
+                        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                        trim_process_memory();
+                        info!("🧹 [MEMÓRIA] Faxina pós-login concluída.");
+                    });
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = app_weak_inner.upgrade() {
+                            ui.set_is_logged_in(true);
+                            ui.set_user_tag(user_tag.into());
+                            ui.set_titlebar_error("".into());
+                            ui.set_login_alert_message("".into());
+                        }
+                    });
+                }
+                GatewayEvent::Disconnected { reason } => {
+                    let reason_clone = reason.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = app_weak_inner.upgrade() {
+                            let clean_reason = if reason_clone.contains("10054") || reason_clone.contains("ConnectionReset") || reason_clone.contains("reset by peer") {
+                                "Conexão reiniciada".to_string()
+                            } else if reason_clone.contains("timeout") || reason_clone.contains("TimedOut") {
+                                "Sem internet / Timeout".to_string()
+                            } else {
+                                format!("Desconectado ({})", reason_clone)
+                            };
+                            ui.set_titlebar_error(clean_reason.into());
+                        }
+                    });
+                }
+                GatewayEvent::MessageCreated { id, channel_id, author, author_id, created_at, avatar_url, is_bot, content, commands, content_lines, embed_content, embed_lines, embed_color, embed_footer, code_block, reply_author, reply_content, reply_command, links, buttons, attachments, is_self } => {
+                    // Deduplicação: ignora se esta mensagem já foi processada anteriormente
+                    if !id.is_empty() && crate::ui::helpers::mark_msg_seen(&id) {
+                        continue;
+                    }
+
+                    let current_active_ch = active_channel_inner.lock().unwrap().clone();
+                    // The sidebar shows one list: the DMs ("@me") or the open server's channels.
+                    // Only a channel in that list has a row to update, and only DMs are
+                    // ordered by recent activity (server channels keep their positions).
+                    let (showing_dms, in_shown_list) = {
+                        let shown_guild = active_guild_inner.lock().unwrap().clone();
+                        let in_list = guilds_map_inner.lock().ok()
+                            .and_then(|m| m.get(&shown_guild).map(|g| g.channels.iter().any(|c| c.id == channel_id)))
+                            .unwrap_or(false);
+                        (shown_guild == "@me", in_list)
+                    };
+                    let visible = APP_IS_VISIBLE.load(Ordering::Relaxed);
+                    // Sidebar row update for this message; while hidden it is only recorded
+                    // and applied when the window comes back.
+                    let sidebar = |new_unread: i32| {
+                        if !visible {
+                            crate::ui::helpers::record_hidden_channel_activity(&channel_id, new_unread);
+                            return;
+                        }
+                        let app_w = app_weak_inner.clone();
+                        let (id, active) = (channel_id.clone(), current_active_ch.clone());
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = app_w.upgrade() {
+                                crate::ui::helpers::apply_channel_activity(&ui, &[(id, new_unread)], &active, showing_dms);
+                            }
+                        });
+                    };
+                    let show_dm_total = |total: i32| {
+                        if visible {
+                            let app_w = app_weak_inner.clone();
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = app_w.upgrade() {
+                                    ui.set_total_dm_unread_count(total);
+                                }
+                            });
+                        }
+                    };
+
+                    if channel_id != current_active_ch {
+                        // Se a mensagem foi enviada pelo próprio usuário (ex: pelo celular), não incrementa badge de não lido
+                        if is_self {
+                            if showing_dms && in_shown_list {
+                                sidebar(0);
+                            }
+                            continue;
+                        }
+
+                        // Mensagem de outro canal/usuário — incrementa badge de não lidos
+                        if crate::ui::helpers::is_dm_channel(&channel_id, &guilds_map_inner) {
+                            show_dm_total(crate::ui::helpers::inc_dm_unread(&channel_id));
+                        }
+                        if in_shown_list {
+                            sidebar(1);
+                        }
+                        continue;
+                    }
+
+                    // Mensagem para o canal ativo atual: limpa o contador deste canal e, se for DM, move para o topo da lista
+                    show_dm_total(crate::ui::helpers::clear_dm_unread(&channel_id));
+                    sidebar(0);
+
+                    if !APP_IS_VISIBLE.load(Ordering::Relaxed) {
+                        // Window is hidden — count message but don't touch Slint.
+                        // Messages will be re-fetched via REST when the window is restored.
+                        let pending = PENDING_MESSAGES.fetch_add(1, Ordering::Relaxed) + 1;
+                        info!("[DeepSleep] Mensagem recebida em background ({} pendente(s)) — UI ignorada.", pending);
+                    } else {
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = app_weak_inner.upgrade() {
+                                let mut current_msgs: Vec<ChatMessage> = ui.get_messages().iter().collect();
+
+                                let slint_cmds: Vec<slint::SharedString> = commands.into_iter().map(|c| c.into()).collect();
+                                let commands_model = std::rc::Rc::new(slint::VecModel::from(slint_cmds));
+
+                                let slint_links: Vec<LinkItem> = links.iter().map(|l| LinkItem {
+                                    label: l.label.clone().into(),
+                                    url: l.url.clone().into(),
+                                    }).collect();
+                                let links_model = std::rc::Rc::new(slint::VecModel::from(slint_links));
+
+                                let mut message = ChatMessage {
+                                    id: id.into(),
+                                    author: author.into(),
+                                    content: content.into(),
+                                    commands: slint::ModelRc::from(commands_model),
+                                    content_lines: map_message_lines(&content_lines, &channel_id, &app_weak_inner),
+                                    embed_content: embed_content.into(),
+                                    embed_lines: map_message_lines(&embed_lines, &channel_id, &app_weak_inner),
+                                    embed_color: parse_hex_color(&embed_color),
+                                    embed_footer: embed_footer.into(),
+                                    code_block: code_block.into(),
+                                    reply_author: reply_author.into(),
+                                    reply_content: reply_content.into(),
+                                    reply_command: reply_command.into(),
+                                    links: slint::ModelRc::from(links_model),
+                                    buttons: map_message_buttons(&buttons, &channel_id, &app_weak_inner),
+                                    attachments: map_message_attachments(&attachments, &app_weak_inner),
+                                    timestamp: crate::utils::i18n_ui::ui_text().now_label.into(),
+                                    ..Default::default()
+                                };
+                                set_message_metadata(&mut message, &author_id, &created_at);
+                                message.avatar_url = avatar_url.into();
+                                message.avatar_initial = message.author.chars().next().unwrap_or('?').to_uppercase().to_string().into();
+                                message.is_bot = is_bot;
+                                current_msgs.push(message);
+                                regroup_messages(&mut current_msgs);
+                                // An append never changes the grouping of older rows. Keep the
+                                // existing model so a new message does not rebuild the chat UI.
+                                let mut appended = current_msgs.pop().expect("message was appended");
+                                avatar_cache::get_avatar_cache().hydrate(std::slice::from_mut(&mut appended), &app_weak_inner);
+                                crate::ui::invite_cards::hydrate(std::slice::from_mut(&mut appended), &app_weak_inner);
+                                let messages = ui.get_messages();
+                                if let Some(model) = messages.as_any().downcast_ref::<slint::VecModel<ChatMessage>>() {
+                                    model.push(appended);
+                                } else {
+                                    current_msgs.push(appended);
+                                    ui.set_messages(std::rc::Rc::new(slint::VecModel::from(current_msgs)).into());
+                                }
+
+                                request_chat_scroll_to_bottom(app_weak_inner.clone());
+                            }
+                        });
+                    }
+                }
+                GatewayEvent::MessageUpdated { id, channel_id, content, commands, content_lines, embed_content, embed_lines, embed_color, embed_footer, code_block, reply_author, reply_content, reply_command, links, buttons, attachments } => {
+                    let current_active_ch = active_channel_inner.lock().unwrap().clone();
+                    // Hidden: the open channel is refetched when the window comes back.
+                    if channel_id != current_active_ch || !APP_IS_VISIBLE.load(Ordering::Relaxed) {
+                        continue;
+                    }
+
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = app_weak_inner.upgrade() {
+                            let mut current_msgs: Vec<ChatMessage> = ui.get_messages().iter().collect();
+
+                            let slint_cmds: Vec<slint::SharedString> = commands.into_iter().map(|c| c.into()).collect();
+                            let commands_model = std::rc::Rc::new(slint::VecModel::from(slint_cmds));
+
+                            let slint_links: Vec<LinkItem> = links.iter().map(|l| LinkItem {
+                                label: l.label.clone().into(),
+                                url: l.url.clone().into(),
+                            }).collect();
+                            let links_model = std::rc::Rc::new(slint::VecModel::from(slint_links));
+
+                            let mut found = false;
+                            for msg in current_msgs.iter_mut() {
+                                if !id.is_empty() && msg.id == id.as_str() {
+                                    msg.content = content.clone().into();
+                                    msg.commands = slint::ModelRc::from(commands_model.clone());
+                                    msg.content_lines = map_message_lines(&content_lines, &channel_id, &app_weak_inner);
+                                    msg.embed_content = embed_content.clone().into();
+                                    msg.embed_lines = map_message_lines(&embed_lines, &channel_id, &app_weak_inner);
+                                    msg.embed_color = parse_hex_color(&embed_color);
+                                    msg.embed_footer = embed_footer.clone().into();
+                                    msg.code_block = code_block.clone().into();
+                                    if !reply_author.is_empty() {
+                                        msg.reply_author = reply_author.clone().into();
+                                    }
+                                    if !reply_content.is_empty() {
+                                        msg.reply_content = reply_content.clone().into();
+                                    }
+                                    if !reply_command.is_empty() {
+                                        msg.reply_command = reply_command.clone().into();
+                                    }
+                                    msg.links = slint::ModelRc::from(links_model.clone());
+                                    msg.buttons = map_message_buttons(&buttons, &channel_id, &app_weak_inner);
+                                    msg.attachments = map_message_attachments(&attachments, &app_weak_inner);
+                                    found = true;
+                                    break;
+                                }
+                            }
+
+                            if !found && (!content.is_empty() || !embed_content.is_empty() || !reply_command.is_empty() || !attachments.is_empty()) {
+                                current_msgs.push(ChatMessage {
+                                    id: id.into(),
+                                    author: "Bot".into(),
+                                    content: content.into(),
+                                    commands: slint::ModelRc::from(commands_model),
+                                    content_lines: map_message_lines(&content_lines, &channel_id, &app_weak_inner),
+                                    embed_content: embed_content.into(),
+                                    embed_lines: map_message_lines(&embed_lines, &channel_id, &app_weak_inner),
+                                    embed_color: parse_hex_color(&embed_color),
+                                    embed_footer: embed_footer.into(),
+                                    code_block: code_block.into(),
+                                    reply_author: reply_author.into(),
+                                    reply_content: reply_content.into(),
+                                    reply_command: reply_command.into(),
+                                    links: slint::ModelRc::from(links_model),
+                                    buttons: map_message_buttons(&buttons, &channel_id, &app_weak_inner),
+                                    attachments: map_message_attachments(&attachments, &app_weak_inner),
+                                    timestamp: crate::utils::i18n_ui::ui_text().now_label.into(),
+                                    show_header: true,
+                                    ..Default::default()
+                                });
+                            }
+
+                            regroup_messages(&mut current_msgs);
+                            let model = std::rc::Rc::new(slint::VecModel::from(current_msgs));
+                            ui.set_messages(model.into());
+                        }
+                    });
+                }
+                GatewayEvent::MessageDeleted { id, channel_id } => {
+                    let current_active_ch = active_channel_inner.lock().unwrap().clone();
+                    // Hidden: the open channel is refetched when the window comes back.
+                    if channel_id != current_active_ch || !APP_IS_VISIBLE.load(Ordering::Relaxed) {
+                        continue;
+                    }
+
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = app_weak_inner.upgrade() {
+                            let mut current_msgs: Vec<ChatMessage> = ui.get_messages().iter().filter(|m| m.id != id.as_str()).collect();
+                            regroup_messages(&mut current_msgs);
+                            avatar_cache::get_avatar_cache().hydrate(&mut current_msgs, &app_weak_inner);
+                            crate::ui::invite_cards::hydrate(&mut current_msgs, &app_weak_inner);
+                            let model = std::rc::Rc::new(slint::VecModel::from(current_msgs));
+                            ui.set_messages(model.into());
+                        }
+                    });
+                }
+                GatewayEvent::VoiceStatesUpdated => {
+                    if !APP_IS_VISIBLE.load(Ordering::Relaxed) {
+                        crate::ui::helpers::VOICE_STATES_DIRTY.store(true, Ordering::Relaxed);
+                        continue;
+                    }
+                    let gid = active_guild_inner.lock().unwrap().clone();
+                    let channels_opt = guilds_map_inner.lock().ok().and_then(|map| map.get(&gid).map(|g| g.channels.clone()));
+                    if let Some(chans) = channels_opt {
+                        let ui_channels = {
+                            let cats_guard = get_collapsed_categories().lock().unwrap().clone();
+                            build_ui_channels(&chans, &cats_guard)
+                        };
+                        let app_w = app_weak_inner.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = app_w.upgrade() {
+                                crate::ui::helpers::update_channel_voice_rows(&ui, ui_channels);
+                            }
+                        });
+                    }
+                }
+                GatewayEvent::GuildLoaded { .. } => {
+                    // Handled via HTTP REST instant fetching
+                }
+                GatewayEvent::IncomingCall { channel_id, caller_name } => {
+                    // Incoming DM call — show notification panel with caller name
+                    let app_w = app_weak_inner.clone();
+                    let ch_id = channel_id.clone();
+                    let caller_raw = caller_name.clone();
+                    let gmap_inc = Arc::clone(&guilds_map_inner);
+
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = app_w.upgrade() {
+                            // If already in a call or voice room, do not show modal
+                            if ui.get_is_in_dm_call() || ui.get_is_in_voice() {
+                                return;
+                            }
+
+                            // 1. Search for the caller name directly in UI channels
+                            let mut resolved_name = String::new();
+                            for ch in ui.get_channels().iter() {
+                                if ch.id == ch_id.as_str() {
+                                    resolved_name = ch.name.to_string();
+                                    break;
+                                }
+                            }
+
+                            // 2. If not found in UI, search in the in-memory DM map
+                            if resolved_name.is_empty() {
+                                if let Ok(gmap) = gmap_inc.lock() {
+                                    if let Some(dm_guild) = gmap.get("@me") {
+                                        if let Some(ch_data) = dm_guild.channels.iter().find(|c| c.id == ch_id) {
+                                            resolved_name = ch_data.name.clone();
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 3. Fallback to event name or "Friend"
+                            if resolved_name.is_empty() {
+                                resolved_name = if !caller_raw.is_empty() && caller_raw != "Someone" {
+                                    caller_raw
+                                } else {
+                                    "Friend".to_string()
+                                };
+                            }
+
+                            ui.set_has_incoming_call(true);
+                            ui.set_incoming_call_channel_id(ch_id.into());
+                            ui.set_incoming_call_caller_name(resolved_name.into());
+                        }
+                    });
+                    sound_effects::play_ui_sound(sound_effects::UiSound::JoinChannel);
+                }
+                GatewayEvent::CallEnded { channel_id } => {
+                    // Call ended or cancelled — close incoming call modal
+                    let app_w = app_weak_inner.clone();
+                    let ch_id = channel_id.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = app_w.upgrade() {
+                            if ui.get_incoming_call_channel_id().as_str() == ch_id {
+                                ui.set_has_incoming_call(false);
+                                ui.set_incoming_call_channel_id("".into());
+                                ui.set_incoming_call_caller_name("".into());
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    app.run()?;
+    crate::ui::window_place::save_now();
+    Ok(())
+}
+

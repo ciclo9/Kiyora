@@ -1,0 +1,133 @@
+// Semantic application theme tokens — Kiyora Identity
+// Components should describe the role of a color, not its concrete shade.
+export enum ThemeMode {
+    dark,
+    light,
+}
+
+// One family (Inter, bundled) and one whole-pixel scale for the whole UI.
+// Fractional sizes and sub-11px text render blurry with the FemtoVG renderer.
+export global TypeScale {
+    out property <string> family: "Inter";
+    out property <length> micro: 11px;     // badges, all-caps section labels
+    out property <length> caption: 12px;   // metadata, hints, timestamps
+    out property <length> small: 13px;     // secondary UI text
+    out property <length> body: 14px;      // default UI text
+    out property <length> title: 16px;     // panel and dialog titles
+    out property <length> heading: 20px;   // page headings
+}
+
+// Chat reads a step larger than the denser navigation and settings UI.
+export global ChatTypography {
+    out property <string> family: TypeScale.family;
+    out property <length> body-size: 15px;
+    out property <length> author-size: 15px;
+    out property <length> preview-size: TypeScale.caption;
+    out property <length> embed-size: TypeScale.body;
+}
+
+// Kiyora brand palette
+// Primary background (deep slate):   #141A23
+// Secondary surfaces / sidebars:     #0F141B  |  #1B2330
+// Subtle borders / separators:       #232D3D
+// Accent (glacial cyan):             #3CD7EB
+// Accent hover:                      #5CE3F4
+// Accent active/pressed:             #26B8CC
+// Text primary:                      #FFFFFF
+// Text secondary / muted:            #94A3B8
+
+export global AppTheme {
+    in-out property <ThemeMode> mode: ThemeMode.dark;
+
+    // Main surfaces — Kiyora deep-slate identity
+    out property <color> surface-window:          mode == ThemeMode.dark ? #141A23 : #ffffff;
+    out property <color> surface-titlebar:        mode == ThemeMode.dark ? #141A23 : #f2f3f5;
+    out property <color> surface-guild-rail:      mode == ThemeMode.dark ? #0F141B : #e3e5e8;
+    out property <color> surface-sidebar:         mode == ThemeMode.dark ? #1B2330 : #f2f3f5;
+    out property <color> surface-sidebar-overlay: mode == ThemeMode.dark ? #1B2330cc : #f2f3f5e6;
+    out property <color> surface-chat:            mode == ThemeMode.dark ? #141A23 : #ffffff;
+    out property <color> surface-input:           mode == ThemeMode.dark ? #0F141B : #ebedef;
+    out property <color> surface-elevated:        mode == ThemeMode.dark ? #1B2330 : #f2f3f5;
+    out property <color> surface-reply:           mode == ThemeMode.dark ? #0F141B : #e8f0fe;
+    out property <color> surface-disabled:        mode == ThemeMode.dark ? #1B2330 : #e3e5e8;
+    out property <color> surface-control:         mode == ThemeMode.dark ? #232D3D : #c4c7cc;
+    out property <color> surface-control-hover:   mode == ThemeMode.dark ? #1B2330 : #b5b8be;
+    out property <color> surface-backdrop:        #00000077;
+    out property <color> surface-scrim:           #00000066;
+    out property <color> surface-overlay:         mode == ThemeMode.dark ? #141A23ee : #fffffff2;
+    out property <color> media-action-background: mode == ThemeMode.dark ? #141A23ee : #26B8CC;
+    out property <color> surface-translucent:     mode == ThemeMode.dark ? #0000002b : #00000018;
+    out property <color> surface-divider-strong:  mode == ThemeMode.dark ? #232D3D : #c8cbd0;
+    out property <color> surface-pressed:         mode == ThemeMode.dark ? #0F141B : #c8cbd0;
+    out property <color> surface-warning:         mode == ThemeMode.dark ? #473a24 : #fff1c2;
+    out property <color> surface-success:         mode == ThemeMode.dark ? #0f3822 : #d8f5e3;
+    out property <color> surface-danger:          mode == ThemeMode.dark ? #3f1515 : #f9d7d9;
+    out property <color> surface-media:           #0F141B;
+    out property <color> surface-media-overlay:   #0F141Be6;
+    out property <color> surface-media-overlay-strong: #0F141Bee;
+    out property <color> solid-white:             #ffffff;
+
+    // Backdrops retain fixed alpha so media and modal contrast stays stable.
+    out property <color> backdrop-soft:     #00000088;
+    out property <color> backdrop:          #000000aa;
+    out property <color> backdrop-strong:   #000000bb;
+    out property <color> backdrop-stronger: #000000cc;
+    out property <color> backdrop-max:      #000000dd;
+
+    // Interaction surfaces
+    out property <color> interactive-hover:    mode == ThemeMode.dark ? #1B2330 : #dfe1e5;
+    out property <color> interactive-selected: mode == ThemeMode.dark ? #232D3D : #d6d9df;
+    out property <color> interactive-muted:    mode == ThemeMode.dark ? #1B2330 : #d1d3d7;
+
+    // Content
+    out property <color> text-strong:     mode == ThemeMode.dark ? #FFFFFF : #060607;
+    out property <color> text-primary:    mode == ThemeMode.dark ? #FFFFFF : #313338;
+    out property <color> text-secondary:  mode == ThemeMode.dark ? #94A3B8 : #4e5058;
+    out property <color> text-muted:      mode == ThemeMode.dark ? #94A3B8 : #5c5e66;
+    out property <color> text-subtle:     mode == ThemeMode.dark ? #64748B : #6d6f78;
+    out property <color> text-faint:      mode == ThemeMode.dark ? #475569 : #74767f;
+    out property <color> text-embed:      mode == ThemeMode.dark ? #CBD5E1 : #3f4147;
+    out property <color> text-reply:      mode == ThemeMode.dark ? #94A3B8 : #526173;
+    out property <color> text-on-accent:  #ffffff;
+    out property <color> text-on-status:  #f1f5f9;
+    out property <color> text-on-warning: #000000;
+
+    // Borders and separators — Kiyora subtle blue-slate
+    out property <color> border-subtle:        mode == ThemeMode.dark ? #232D3D : #d1d3d7;
+    out property <color> separator:            mode == ThemeMode.dark ? #232D3D : #d1d3d7;
+    out property <color> border-on-accent-muted: #ffffffcc;
+
+    // Brand and semantic states — Kiyora glacial cyan accent
+    out property <color> accent:                #3CD7EB;
+    out property <color> accent-hover:          #5CE3F4;
+    out property <color> accent-bright:         #5CE3F4;
+    out property <color> accent-medium:         #3CD7EB;
+    out property <color> accent-link-hover:     #5CE3F4;
+    out property <color> accent-soft:           mode == ThemeMode.dark ? #3CD7EB : #26B8CC;
+    out property <color> accent-subtle:         mode == ThemeMode.dark ? #3CD7EB33 : #3CD7EB22;
+    out property <color> accent-faint:          mode == ThemeMode.dark ? #3CD7EB38 : #3CD7EB24;
+    out property <color> accent-selected:       mode == ThemeMode.dark ? #3CD7EB55 : #3CD7EB2b;
+    out property <color> accent-border-muted:   mode == ThemeMode.dark ? #3CD7EB88 : #3CD7EB66;
+    out property <color> accent-border-strong:  mode == ThemeMode.dark ? #3CD7EBaa : #3CD7EB99;
+    out property <color> link:                  mode == ThemeMode.dark ? #3CD7EB : #26B8CC;
+    out property <color> info:                  #3CD7EB;
+    out property <color> success:               #23a55a;
+    out property <color> success-hover:         #1f8b4c;
+    out property <color> success-action-hover:  #208b4c;
+    out property <color> success-subtle:        mode == ThemeMode.dark ? #23a55a22 : #16813d1f;
+    out property <color> success-faint:         mode == ThemeMode.dark ? #23a55a20 : #16813d1a;
+    out property <color> warning:               #f0b232;
+    out property <color> warning-strong:        #d97706;
+    out property <color> danger:                #f23f43;
+    out property <color> danger-action:         #da373c;
+    out property <color> danger-action-hover:   #c0353b;
+    out property <color> danger-deep:           #a8282c;
+    out property <color> danger-medium:         #c83236;
+    out property <color> danger-subtle:         mode == ThemeMode.dark ? #f23f4333 : #d83c4030;
+    out property <color> danger-action-subtle:  mode == ThemeMode.dark ? #da373c22 : #d83c401f;
+    out property <color> danger-action-faint:   mode == ThemeMode.dark ? #da373c38 : #d83c4030;
+    out property <color> danger-action-muted:   mode == ThemeMode.dark ? #da373c33 : #d83c402b;
+    out property <color> danger-action-border:  mode == ThemeMode.dark ? #da373c88 : #d83c4077;
+    out property <color> danger-bright:         #dc2626;
+    out property <color> danger-pressed:        #991b1b;
+}

@@ -1,0 +1,250 @@
+﻿name: Build & Release kiyora
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a GitHub Release (leave unchecked to only build the artifacts)"
+        type: boolean
+        default: false
+      features:
+        description: "Extra cargo features for a test build (e.g. automation). Never published."
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  # Empty on pushes, tags and pull requests; only a manual run can set it.
+  CARGO_FEATURES: ${{ inputs.features }}
+
+jobs:
+  build-windows:
+    name: Build Windows (Installer & Portable)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # Rust-aware cache: restores registry, git deps and compiled artifacts
+      # Uses fallback restore keys so partial cache hits still save time
+      - name: Cache Rust dependencies & build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "windows-release"
+          cache-on-failure: true
+
+      - name: Build Windows Binary (Release)
+        shell: bash
+        run: cargo build --release --bin kiyora ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
+
+      - name: Package Windows Portable (.zip)
+        shell: pwsh
+        run: |
+          mkdir -p package_portable
+          Copy-Item target/release/kiyora.exe package_portable/
+          Copy-Item README.md package_portable/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path package_portable/* -DestinationPath kiyora-windows-x64-portable.zip
+
+      - name: Build Windows Installer (Inno Setup)
+        shell: pwsh
+        run: |
+          iscc installer.iss
+
+      - name: Upload Windows Portable Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kiyora-windows-x64-portable
+          path: kiyora-windows-x64-portable.zip
+
+      - name: Upload Windows Setup Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kiyora-Setup-x64
+          path: target/installer/kiyora-Setup-x64.exe
+
+  build-linux:
+    name: Build Linux (.tar.gz)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux System Dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            pkg-config \
+            libasound2-dev \
+            libssl-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            libx11-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libxkbcommon-x11-dev \
+            libxkbcommon-x11-0 \
+            patchelf \
+            xvfb
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      # Rust-aware cache: restores registry, git deps and compiled artifacts
+      - name: Cache Rust dependencies & build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "linux-release"
+          cache-on-failure: true
+
+      - name: Build Linux Binary (Release)
+        run: cargo build --release --bin kiyora ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
+
+      - name: Package Linux Binary (.tar.gz)
+        run: |
+          mkdir -p release-pkg
+          cp target/release/kiyora release-pkg/
+          cp -r assets release-pkg/
+          cp README.md release-pkg/ 2>/dev/null || true
+          tar -czvf kiyora-linux-x64.tar.gz -C release-pkg .
+
+      - name: Upload Linux tar.gz Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kiyora-linux-x64
+          path: kiyora-linux-x64.tar.gz
+
+  # Anylinux AppImage, built the way pkgforge-dev documents it:
+  # https://pkgforge-dev.github.io/Anylinux-AppImages/HOW-TO-MAKE-THESE.html
+  # - build on Arch Linux (never Debian/Fedora), app installed under /usr
+  # - quick-sharun bundles the binary + every dlopen'd lib, sharun is the AppRun
+  # - no LD_LIBRARY_PATH tricks, libc is bundled so it runs on musl/old distros too
+  build-appimage:
+    name: Build Anylinux AppImage
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    steps:
+      - name: Install build & bundling dependencies (Arch)
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm --needed \
+            base-devel git wget file strace rust clang cmake nasm pkgconf patchelf \
+            alsa-lib openssl gtk3 libayatana-appindicator xdotool \
+            libx11 libxcb libxkbcommon libxkbcommon-x11 wayland fontconfig freetype2 \
+            mesa vulkan-icd-loader pipewire pipewire-alsa \
+            gstreamer gst-plugins-base gst-plugins-good gst-plugin-pipewire \
+            xorg-server-xvfb
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cache Rust dependencies & build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "linux-appimage"
+          cache-on-failure: true
+
+      - name: Build and install kiyora under /usr
+        run: |
+          cargo build --release --bin kiyora ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
+          install -Dm755 target/release/kiyora /usr/bin/kiyora
+
+      - name: Bundle Anylinux AppImage (quick-sharun)
+        env:
+          DESKTOP: assets/kiyora.desktop
+          ICON: assets/kiyora.png
+          OUTPATH: ./dist
+          OUTNAME: kiyora-x86_64.AppImage
+          # Slint/winit renders through OpenGL; cpal talks to ALSA, which the
+          # PipeWire plugin must serve; tray-icon pulls GTK3 + appindicator.
+          DEPLOY_OPENGL: 1
+          DEPLOY_PIPEWIRE: 1
+          DEPLOY_GTK: 1
+          # Screen capture shells out to gst-launch-1.0 (src/screen_capture), so
+          # ship GStreamer and the launcher itself inside the AppImage.
+          DEPLOY_GSTREAMER: 1
+        run: |
+          wget --retry-connrefused --tries=5 -q \
+            https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/refs/heads/main/useful-tools/quick-sharun.sh \
+            -O ./quick-sharun
+          chmod +x ./quick-sharun
+          mkdir -p dist
+          # xvfb: quick-sharun briefly runs the binary to discover dlopen'd libs.
+          xvfb-run -a -- ./quick-sharun /usr/bin/kiyora /usr/bin/gst-launch-1.0
+          ./quick-sharun --make-appimage
+          ls -lh dist
+          test -f dist/kiyora-x86_64.AppImage
+
+      - name: Upload Linux AppImage Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kiyora-x86_64.AppImage
+          path: dist/kiyora-x86_64.AppImage
+
+  create-release:
+    name: Publish GitHub Release
+    needs: [build-windows, build-linux, build-appimage]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish == true && inputs.features == '')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Versão detectada: $VERSION"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Display downloaded files
+        run: ls -lh release-artifacts
+
+      # The update dialog of older clients shows the release name. Notes = this
+      # version's changelog; a required update says so there, not in every name.
+      - name: Extract release notes from CHANGELOG
+        run: |
+          awk '/^## \[v/{n++} n==1' CHANGELOG.md | sed '1d' > release-notes.md
+          test -s release-notes.md
+          head -5 release-notes.md
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', steps.version.outputs.version) }}
+          name: "kiyora v${{ steps.version.outputs.version }}"
+          body_path: release-notes.md
+          files: |
+            release-artifacts/kiyora-Setup-x64.exe
+            release-artifacts/kiyora-windows-x64-portable.zip
+            release-artifacts/kiyora-linux-x64.tar.gz
+            release-artifacts/kiyora-x86_64.AppImage
+          generate_release_notes: false
+          append_body: false
+          draft: false
+          prerelease: false
+
+

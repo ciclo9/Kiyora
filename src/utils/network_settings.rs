@@ -1,0 +1,193 @@
+﻿use std::sync::{Mutex, OnceLock};
+use serde::{Deserialize, Serialize};
+use log::{info, error};
+
+pub const NETWORK_SETTINGS_FILE: &str = ".kiyora_network_settings.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkSettings {
+    /// "off" | "http" | "socks5" | "system"
+    pub proxy_mode: String,
+    pub proxy_host: String,
+    pub proxy_port: u16,
+    pub proxy_username: String,
+    pub proxy_password: String,
+    /// Se ativado, tenta rotear chamadas de mídia; por padrão falso (mantém UDP direto para mínima latência)
+    pub route_media: bool,
+}
+
+impl Default for NetworkSettings {
+    fn default() -> Self {
+        Self {
+            proxy_mode: "off".to_string(),
+            proxy_host: "127.0.0.1".to_string(),
+            proxy_port: 8080,
+            proxy_username: String::new(),
+            proxy_password: String::new(),
+            route_media: false,
+        }
+    }
+}
+
+static NETWORK_SETTINGS: OnceLock<Mutex<NetworkSettings>> = OnceLock::new();
+
+pub fn get_network_settings_store() -> &'static Mutex<NetworkSettings> {
+    NETWORK_SETTINGS.get_or_init(|| {
+        let settings = if let Ok(data) = std::fs::read_to_string(NETWORK_SETTINGS_FILE) {
+            serde_json::from_str::<NetworkSettings>(&data).unwrap_or_default()
+        } else {
+            NetworkSettings::default()
+        };
+        info!("🌐 Network and Proxy settings loaded: mode={}", settings.proxy_mode);
+        Mutex::new(settings)
+    })
+}
+
+pub fn get_network_settings() -> NetworkSettings {
+    get_network_settings_store().lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+pub fn save_network_settings(settings: &NetworkSettings) {
+    {
+        let mut store = get_network_settings_store().lock().unwrap_or_else(|e| e.into_inner());
+        *store = settings.clone();
+    }
+    if let Ok(json) = serde_json::to_string_pretty(settings) {
+        let _ = std::fs::write(NETWORK_SETTINGS_FILE, json);
+    }
+}
+
+pub fn update_network_settings(
+    mode: String,
+    host: String,
+    port: u16,
+    user: String,
+    pass: String,
+    route_media: bool,
+) {
+    let settings = NetworkSettings {
+        proxy_mode: mode,
+        proxy_host: host,
+        proxy_port: port,
+        proxy_username: user,
+        proxy_password: pass,
+        route_media,
+    };
+    save_network_settings(&settings);
+    info!("🌐 Configurações de Proxy salvas: modo={}, host={}:{}", settings.proxy_mode, settings.proxy_host, settings.proxy_port);
+}
+
+/// Aplica a configuração de proxy ativa a qualquer `reqwest::ClientBuilder`
+pub fn apply_proxy_to_builder(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let settings = get_network_settings();
+    match settings.proxy_mode.as_str() {
+        "http" | "https" => {
+            let url = format!("http://{}:{}", settings.proxy_host.trim(), settings.proxy_port);
+            match reqwest::Proxy::all(&url) {
+                Ok(mut p) => {
+                    if !settings.proxy_username.is_empty() {
+                        p = p.basic_auth(&settings.proxy_username, &settings.proxy_password);
+                    }
+                    info!("🌐 Aplicando Proxy HTTP/HTTPS: {}", url);
+                    builder = builder.proxy(p);
+                }
+                Err(e) => {
+                    error!("❌ Failed to configure HTTP Proxy ({}): {:?}", url, e);
+                }
+            }
+        }
+        "socks5" => {
+            let url = format!("socks5://{}:{}", settings.proxy_host.trim(), settings.proxy_port);
+            match reqwest::Proxy::all(&url) {
+                Ok(mut p) => {
+                    if !settings.proxy_username.is_empty() {
+                        p = p.basic_auth(&settings.proxy_username, &settings.proxy_password);
+                    }
+                    info!("🌐 Aplicando Proxy SOCKS5: {}", url);
+                    builder = builder.proxy(p);
+                }
+                Err(e) => {
+                    error!("❌ Failed to configure SOCKS5 Proxy ({}): {:?}", url, e);
+                }
+            }
+        }
+        "system" => {
+            info!("🌐 Utilizando Proxy do Sistema Operacional.");
+            // reqwest consulta variáveis de ambiente do sistema (HTTP_PROXY / HTTPS_PROXY / ALL_PROXY)
+        }
+        _ => {
+            // "off" (Direct) -> Desativa qualquer proxy de ambiente
+            builder = builder.no_proxy();
+        }
+    }
+    builder
+}
+
+/// Constrói um `reqwest::Client` genérico com o proxy e user-agent configurados
+pub fn build_generic_http_client() -> reqwest::Client {
+    let builder = reqwest::Client::builder()
+        .user_agent(crate::utils::client_identity::user_agent());
+    apply_proxy_to_builder(builder).build().unwrap_or_default()
+}
+
+/// Testa a conexão do proxy tentando bater na API pública do Discord
+pub async fn test_proxy_connection() -> Result<String, String> {
+    let client = build_generic_http_client();
+    let url = "https://discord.com/api/v10/gateway";
+    let start = std::time::Instant::now();
+    match client.get(url).timeout(std::time::Duration::from_secs(6)).send().await {
+        Ok(resp) => {
+            let latency_ms = start.elapsed().as_millis();
+            if resp.status().is_success() {
+                Ok(format!("Conexão bem-sucedida! Latência: {}ms (Status: {})", latency_ms, resp.status()))
+            } else {
+                Ok(format!("Proxy respondeu em {}ms, mas com status HTTP {}", latency_ms, resp.status()))
+            }
+        }
+        Err(e) => {
+            Err(format!("Failed to connect via Proxy: {}", e))
+        }
+    }
+}
+
+/// Verifica se o erro ocorrido tem indícios de ser causado por proxy inacessível ou falha de conexão com o proxy
+pub fn is_proxy_error(err_str: &str) -> bool {
+    let settings = get_network_settings();
+    if settings.proxy_mode == "off" {
+        return false;
+    }
+    let lower = err_str.to_lowercase();
+    // Se for 401 Unauthorized e NÃO contiver indicação de falha de conexão TCP/HTTP, o Discord respondeu diretamente rejeitando o token
+    if lower.contains("401") && !lower.contains("connect") && !lower.contains("10061") && !lower.contains("refused") {
+        return false;
+    }
+    lower.contains("connect")
+        || lower.contains("10061")
+        || lower.contains("refused")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("proxy")
+        || lower.contains("socks")
+        || lower.contains("erro de rede")
+        || lower.contains("reset by peer")
+        || lower.contains("failed to lookup")
+        || lower.contains("websocket")
+        || lower.contains("ws")
+        || lower.contains("handshake")
+        || !lower.contains("401")
+}
+
+/// Formata a mensagem de alerta amigável e instrutiva para a tela de login
+pub fn format_proxy_alert_message() -> String {
+    let settings = get_network_settings();
+    let mode = settings.proxy_mode.to_uppercase();
+    if settings.proxy_mode == "system" {
+        "Falha de conexão via Proxy do Sistema! Clique aqui ou na engrenagem no topo para abrir as Configurações e desativá-lo.".to_string()
+    } else {
+        format!(
+            "O Proxy ({}: {}:{}) está inacessível ou recusando conexão! Clique aqui ou na engrenagem no topo para abrir as Configurações e desativá-lo.",
+            mode, settings.proxy_host, settings.proxy_port
+        )
+    }
+}
+

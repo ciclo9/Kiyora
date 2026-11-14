@@ -1,0 +1,1316 @@
+﻿#![allow(dead_code)]
+
+
+use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize}};
+use log::{info, warn};
+
+use crate::{
+    AppWindow, ChannelItem, MessageLine, MessageBlock, MessageButton, MessageAttachment,
+    CommandSuggestion, SettingOptionItem, LanguageItem,
+};
+use crate::http::DiscordHttpClient;
+use crate::gateway::{self, ChannelData};
+use crate::utils::i18n;
+use crate::utils::i18n_ui;
+use crate::utils::video_settings;
+use crate::utils::attachment_cache;
+use crate::utils::emoji_cache;
+use std::sync::Mutex;
+use slint::Model;
+use std::collections::{HashMap, HashSet, VecDeque};
+
+static DM_UNREAD_MAP: std::sync::LazyLock<Mutex<HashMap<String, i32>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static PROCESSED_MSG_IDS: std::sync::LazyLock<Mutex<(HashSet<String>, VecDeque<String>)>> =
+    std::sync::LazyLock::new(|| Mutex::new((HashSet::new(), VecDeque::new())));
+
+pub fn get_dm_unread(ch_id: &str) -> i32 {
+    DM_UNREAD_MAP.lock().unwrap().get(ch_id).copied().unwrap_or(0)
+}
+
+pub fn inc_dm_unread(ch_id: &str) -> i32 {
+    let mut map = DM_UNREAD_MAP.lock().unwrap();
+    let count = map.entry(ch_id.to_string()).or_insert(0);
+    *count += 1;
+    map.values().sum()
+}
+
+pub fn clear_dm_unread(ch_id: &str) -> i32 {
+    let mut map = DM_UNREAD_MAP.lock().unwrap();
+    map.remove(ch_id);
+    map.values().sum()
+}
+
+pub fn get_total_dm_unreads() -> i32 {
+    DM_UNREAD_MAP.lock().unwrap().values().sum()
+}
+
+pub fn mark_msg_seen(id: &str) -> bool {
+    if id.is_empty() {
+        return false;
+    }
+    let mut guard = PROCESSED_MSG_IDS.lock().unwrap();
+    if guard.0.contains(id) {
+        return true;
+    }
+    guard.0.insert(id.to_string());
+    guard.1.push_back(id.to_string());
+    if guard.1.len() > 1000 {
+        if let Some(old) = guard.1.pop_front() {
+            guard.0.remove(&old);
+        }
+    }
+    false
+}
+
+pub fn reset_unread_and_dedup_state() {
+    DM_UNREAD_MAP.lock().unwrap().clear();
+    let mut guard = PROCESSED_MSG_IDS.lock().unwrap();
+    guard.0.clear();
+    guard.1.clear();
+}
+
+pub fn is_dm_channel(ch_id: &str, guilds_map: &Arc<Mutex<HashMap<String, crate::gateway::GuildData>>>) -> bool {
+    if let Ok(map) = guilds_map.lock() {
+        if let Some(dm_guild) = map.get("@me") {
+            return dm_guild.channels.iter().any(|c| c.id == ch_id);
+        }
+    }
+    false
+}
+
+pub fn request_chat_scroll_to_bottom(app_weak: slint::Weak<AppWindow>) {
+    let _ = slint::invoke_from_event_loop(move || {
+        let delays = [15, 45, 100, 200, 400];
+        for delay in delays {
+            let app_w = app_weak.clone();
+            slint::Timer::single_shot(std::time::Duration::from_millis(delay), move || {
+                if let Some(ui) = app_w.upgrade() {
+                    ui.invoke_scroll_chat_to_bottom();
+                }
+            });
+        }
+    });
+}
+
+pub fn parse_hex_color(hex: &str) -> slint::Color {
+    if hex.starts_with('#') && hex.len() == 7 {
+        if let Ok(r) = u8::from_str_radix(&hex[1..3], 16) {
+            if let Ok(g) = u8::from_str_radix(&hex[3..5], 16) {
+                if let Ok(b) = u8::from_str_radix(&hex[5..7], 16) {
+                    return slint::Color::from_rgb_u8(r, g, b);
+                }
+            }
+        }
+    }
+    slint::Color::from_rgb_u8(88, 101, 242) // default blurple
+}
+
+/// True when the window is visible; false when hidden to the system tray.
+/// Guards all UI-rendering loops so they sleep when not needed.
+pub static APP_IS_VISIBLE: AtomicBool = AtomicBool::new(true);
+
+/// Woken when the window comes back from the tray or the voice connection
+/// changes, so UI loops can sleep instead of ticking while they have nothing to show.
+pub static UI_LOOPS_WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+pub fn wake_ui_loops() {
+    UI_LOOPS_WAKE.notify_waiters();
+}
+
+/// Set to true by the tray restore paths to signal a REST refresh is needed.
+pub static NEED_UI_REFRESH: AtomicBool = AtomicBool::new(false);
+
+/// Number of messages received while the window was hidden.
+/// Cleared when the window is restored and a REST refresh is triggered.
+pub static PENDING_MESSAGES: AtomicUsize = AtomicUsize::new(0);
+
+/// Sidebar activity that arrived while the window was hidden: (channel id, new unread
+/// messages), oldest first, one entry per channel. Applied when the window comes back.
+static HIDDEN_CHANNEL_ACTIVITY: Mutex<Vec<(String, i32)>> = Mutex::new(Vec::new());
+
+/// True while the settings modal (with the microphone level meter) is open.
+pub static MIC_METER_VISIBLE: AtomicBool = AtomicBool::new(false);
+
+/// Set while hidden when voice states changed, so the channel list is refreshed on restore.
+pub static VOICE_STATES_DIRTY: AtomicBool = AtomicBool::new(false);
+
+pub fn record_hidden_channel_activity(channel_id: &str, new_unread: i32) {
+    if let Ok(mut pending) = HIDDEN_CHANNEL_ACTIVITY.lock() {
+        let earlier = pending
+            .iter()
+            .position(|(id, _)| id == channel_id)
+            .map(|i| pending.remove(i).1)
+            .unwrap_or(0);
+        pending.push((channel_id.to_string(), earlier + new_unread));
+    }
+}
+
+pub fn take_hidden_channel_activity() -> Vec<(String, i32)> {
+    HIDDEN_CHANNEL_ACTIVITY.lock().map(|mut pending| std::mem::take(&mut *pending)).unwrap_or_default()
+}
+
+/// Applies sidebar activity in order: each channel's unread count grows by its new
+/// messages (the open channel goes back to 0) and, in the DM list, it moves to the top.
+pub fn apply_channel_activity(ui: &AppWindow, activity: &[(String, i32)], active_channel: &str, showing_dms: bool) {
+    let mut channels: Vec<ChannelItem> = ui.get_channels().iter().collect();
+    let mut changed = false;
+    for (id, new_unread) in activity {
+        let Some(pos) = channels.iter().position(|c| c.id == id.as_str()) else { continue };
+        let unread = if id == active_channel { 0 } else { channels[pos].unread_count + new_unread };
+        if channels[pos].unread_count != unread {
+            channels[pos].unread_count = unread;
+            changed = true;
+        }
+        if showing_dms && pos != 0 {
+            let ch = channels.remove(pos);
+            channels.insert(0, ch);
+            changed = true;
+        }
+    }
+    if changed {
+        ui.set_channels(std::rc::Rc::new(slint::VecModel::from(channels)).into());
+    }
+}
+
+/// Refreshes voice counts and participants from `fresh` (a `build_ui_channels` result).
+/// Rows are matched by id, so the current order (recent DMs first) and unread counts stay.
+pub fn update_channel_voice_rows(ui: &AppWindow, fresh: Vec<ChannelItem>) {
+    let current = ui.get_channels();
+    let fresh_by_id: HashMap<String, &ChannelItem> = fresh.iter().map(|c| (c.id.to_string(), c)).collect();
+    let same_rows = current.row_count() == fresh.len()
+        && (0..current.row_count()).all(|i| current.row_data(i).is_some_and(|c| fresh_by_id.contains_key(c.id.as_str())));
+    if same_rows {
+        for i in 0..current.row_count() {
+            let Some(old) = current.row_data(i) else { continue };
+            let new = fresh_by_id[old.id.as_str()];
+            if old.voice_count != new.voice_count || old.name != new.name {
+                let mut row = new.clone();
+                row.unread_count = old.unread_count;
+                current.set_row_data(i, row);
+            }
+        }
+        return;
+    }
+    let unread: HashMap<String, i32> = current
+        .iter()
+        .filter(|c| c.unread_count > 0)
+        .map(|c| (c.id.to_string(), c.unread_count))
+        .collect();
+    let rows: Vec<ChannelItem> = fresh
+        .into_iter()
+        .map(|mut c| {
+            if let Some(&n) = unread.get(c.id.as_str()) {
+                c.unread_count = n;
+            }
+            c
+        })
+        .collect();
+    ui.set_channels(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+}
+
+pub fn apply_i18n_translations(ui: &AppWindow, lang: i18n::Language) {
+    let resolved = match lang {
+        i18n::Language::Auto => i18n::detect_os_language(),
+        specific => specific,
+    };
+
+    let tr = match resolved {
+        i18n::Language::Portuguese => &i18n::PT_TRANSLATIONS,
+        i18n::Language::Spanish => &i18n::ES_TRANSLATIONS,
+        i18n::Language::German => &i18n::DE_TRANSLATIONS,
+        i18n::Language::French => &i18n::FR_TRANSLATIONS,
+        i18n::Language::Russian => &i18n::RU_TRANSLATIONS,
+        i18n::Language::Japanese => &i18n::JA_TRANSLATIONS,
+        _ => &i18n::EN_TRANSLATIONS,
+    };
+
+    ui.set_current_language_code(lang.code().into());
+    i18n_ui::set_current(resolved);
+    i18n_ui::apply_to_window(ui, i18n_ui::table_for(resolved));
+    crate::ui::message_grouping::relabel_day_separators(&ui.get_messages());
+    ui.set_tr_login_title(tr.login_title.into());
+    ui.set_tr_login_desc(tr.login_desc.into());
+    ui.set_tr_login_placeholder(tr.login_placeholder.into());
+    ui.set_tr_login_btn_connect(tr.login_btn_connect.into());
+    ui.set_tr_login_btn_detect(tr.login_btn_detect.into());
+    ui.set_tr_server_channels(tr.server_channels.into());
+    ui.set_tr_leave(tr.leave.into());
+    ui.set_tr_view_text_chat(tr.view_text_chat.into());
+    ui.set_tr_leave_call(tr.leave_call.into());
+    ui.set_tr_voice_participants_title(tr.voice_participants_title.into());
+    ui.set_tr_badge_you(tr.you.into());
+    ui.set_tr_view_voice_room(tr.view_voice_room.into());
+    ui.set_tr_replying_to(tr.replying_to.into());
+    ui.set_tr_chat_placeholder_prefix(tr.chat_placeholder_prefix.into());
+    ui.set_tr_send(tr.send.into());
+    ui.set_tr_settings_title(tr.settings_title.into());
+    ui.set_tr_settings_language_label(tr.settings_language_label.into());
+    ui.set_tr_settings_input_device(tr.settings_input_device.into());
+    ui.set_tr_settings_output_device(tr.settings_output_device.into());
+    ui.set_tr_settings_threshold(tr.settings_threshold.into());
+    ui.set_tr_settings_mic_level(tr.settings_mic_level.into());
+    ui.set_tr_settings_btn_test_start(match resolved {
+        i18n::Language::Portuguese => "Testar Microfone (\"Se Ouvir\")".into(),
+        i18n::Language::Spanish => "Probar Micrófono (\"Escucharse\")".into(),
+        i18n::Language::German => "Mikrofon testen (\"Sich hören\")".into(),
+        i18n::Language::French => "Tester le Micro (\"S'entendre\")".into(),
+        i18n::Language::Russian => "Проверить микрофон (\"Слышать себя\")".into(),
+        i18n::Language::Japanese => "マイクをテスト (自分の声を聞く)".into(),
+        _ => "Test Microphone (\"Hear Yourself\")".into(),
+    });
+    ui.set_tr_settings_btn_test_stop(match resolved {
+        i18n::Language::Portuguese => "Parar Teste (Ouvindo...)".into(),
+        i18n::Language::Spanish => "Detener Prueba (Escuchando...)".into(),
+        i18n::Language::German => "Test beenden (Hören...)".into(),
+        i18n::Language::French => "Arrêter le Test (Écoute...)".into(),
+        i18n::Language::Russian => "Остановить тест (Слушаем...)".into(),
+        i18n::Language::Japanese => "テスト停止 (聴取中...)".into(),
+        _ => "Stop Testing (Listening...)".into(),
+    });
+    ui.set_tr_settings_done(tr.settings_done.into());
+    ui.set_tr_logout_title(tr.logout_title.into());
+    ui.set_tr_logout_confirm_prefix(tr.logout_confirm_prefix.into());
+    ui.set_tr_cancel(tr.cancel.into());
+    ui.set_tr_confirm_logout(tr.confirm_logout.into());
+    ui.set_tr_voice_connecting(tr.voice_connecting.into());
+    ui.set_tr_voice_connecting_title(tr.voice_connecting_title.into());
+    ui.set_tr_voice_connecting_desc(tr.voice_connecting_desc.into());
+    ui.set_tr_voice_connected(tr.voice_connected.into());
+    ui.set_tr_qr_title(tr.qr_title.into());
+    ui.set_tr_qr_desc(tr.qr_desc.into());
+    ui.set_tr_qr_confirm(tr.qr_confirm.into());
+    ui.set_tr_settings_tab_voice(tr.settings_tab_voice.into());
+    ui.set_tr_settings_tab_language(tr.settings_tab_language.into());
+    ui.set_tr_settings_tab_keybinds(tr.settings_tab_keybinds.into());
+    ui.set_tr_settings_tab_security(tr.settings_tab_security.into());
+    ui.set_tr_settings_tab_network_proxy(tr.settings_tab_network_proxy.into());
+    ui.set_tr_settings_tab_updates(tr.settings_tab_updates.into());
+    ui.set_tr_keybind_mute_title(tr.keybind_mute_title.into());
+    ui.set_tr_keybind_mute_desc(tr.keybind_mute_desc.into());
+    ui.set_tr_keybind_deafen_title(tr.keybind_deafen_title.into());
+    ui.set_tr_keybind_deafen_desc(tr.keybind_deafen_desc.into());
+    ui.set_tr_keybind_recording_prompt(tr.keybind_recording_prompt.into());
+    ui.set_tr_keybind_btn_record(tr.keybind_btn_record.into());
+    ui.set_tr_keybind_btn_clear(tr.keybind_btn_clear.into());
+    ui.set_tr_keybind_guide_title(tr.keybind_guide_title.into());
+    ui.set_tr_keybind_guide_desc(tr.keybind_guide_desc.into());
+
+    let lang_items: Vec<LanguageItem> = i18n::Language::all_available().iter().map(|&l| {
+        let (display, native) = l.display_info();
+        LanguageItem {
+            code: l.code().into(),
+            name: display.into(),
+            native_name: native.into(),
+            is_selected: l == lang,
+        }
+    }).collect();
+    ui.set_languages(std::rc::Rc::new(slint::VecModel::from(lang_items)).into());
+    #[cfg(windows)]
+    populate_video_interface_settings(ui);
+}
+
+pub fn populate_video_interface_settings(ui: &AppWindow) {
+    let enc = video_settings::get_video_encoder();
+    let vcap = video_settings::get_video_capture_backend();
+    let aloop = video_settings::get_audio_loopback_backend();
+    let notice = video_settings::get_enable_self_preview_notice();
+    let show_hw = video_settings::get_show_hardware_monitor();
+    ui.set_use_gpu_renderer(video_settings::get_use_gpu_renderer());
+    let use_light_theme = video_settings::get_use_light_theme();
+
+    ui.set_selected_video_encoder(enc.clone().into());
+    ui.set_selected_video_capture_backend(vcap.clone().into());
+    ui.set_selected_audio_loopback_backend(aloop.clone().into());
+    ui.set_enable_self_preview_notice(notice);
+    ui.set_show_hardware_monitor(show_hw);
+    ui.set_use_light_theme(use_light_theme);
+
+    #[cfg(target_os = "windows")]
+    let enc_items = {
+        use crate::screen_capture::gpu_capture::{self, Choice};
+        ui.set_gpu_selection_available(true);
+        let text = i18n_ui::ui_text();
+        let choice = gpu_capture::parse_choice(&enc);
+        let gpus = gpu_capture::gpus();
+        let selected = match choice {
+            Choice::Gpu { vendor, device } => gpus.iter()
+                .find(|g| g.vendor == vendor && (device == 0 || device == g.device)).map(|g| g.id()),
+            _ => None,
+        };
+        let mut items = vec![SettingOptionItem {
+            id: "auto".into(), name: text.gpu_auto.into(), desc: text.gpu_auto_desc.into(),
+            is_selected: choice == Choice::Auto,
+        }];
+        for gpu in gpus {
+            let codec = match gpu.vendor { 0x10de => "NVENC", 0x8086 => "Quick Sync", 0x1002 => "AMF", _ => "GPU" };
+            items.push(SettingOptionItem {
+                id: gpu.id().into(), name: gpu.name.clone().into(),
+                desc: format!("{} · {}", codec, if gpu.drives_display { text.gpu_display_desc } else { text.gpu_other_desc }).into(),
+                is_selected: selected.as_deref() == Some(gpu.id().as_str()),
+            });
+        }
+        if matches!(choice, Choice::Gpu { .. }) && selected.is_none() {
+            items.push(SettingOptionItem {
+                id: enc.clone().into(), name: text.gpu_missing.into(), desc: text.gpu_next_stream.into(), is_selected: true,
+            });
+        }
+        items.push(SettingOptionItem {
+            id: "openh264".into(), name: text.gpu_cpu.into(), desc: text.gpu_cpu_desc.into(),
+            is_selected: choice == Choice::Cpu,
+        });
+        refresh_stream_capture_status(ui);
+        items
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let enc_items = vec![
+        SettingOptionItem {
+            id: "auto".into(),
+            name: "Automático (Recomendado)".into(),
+            desc: "Prioriza aceleração por hardware GPU disponível com fallback para CPU.".into(),
+            is_selected: enc == "auto",
+        },
+        SettingOptionItem {
+            id: "nvenc".into(),
+            name: "NVIDIA NVENC".into(),
+            desc: "Codificação acelerada por hardware via GPU NVIDIA GeForce / RTX.".into(),
+            is_selected: enc == "nvenc",
+        },
+        SettingOptionItem {
+            id: "ffmpeg".into(),
+            name: "FFmpeg Hardware (VA-API / QSV)".into(),
+            desc: "Pipeline acelerado por GPU via FFmpeg (VA-API, QSV, NVENC).".into(),
+            is_selected: enc == "ffmpeg",
+        },
+        SettingOptionItem {
+            id: "openh264".into(),
+            name: "Cisco OpenH264 (CPU)".into(),
+            desc: "Codificação universal por software multithread com otimizações SIMD.".into(),
+            is_selected: enc == "openh264",
+        },
+    ];
+
+    #[cfg(target_os = "windows")]
+    let vcap_items = vec![
+        SettingOptionItem {
+            id: "auto".into(),
+            name: "Automático (Recomendado)".into(),
+            desc: "Tenta PrintWindow para janelas DirectX e usa BitBlt GDI para desktop e fallback.".into(),
+            is_selected: vcap == "auto",
+        },
+        SettingOptionItem {
+            id: "printwindow".into(),
+            name: "PrintWindow (DirectX / DWM)".into(),
+            desc: "Captura direta de janelas em primeiro ou segundo plano via DWM.".into(),
+            is_selected: vcap == "printwindow",
+        },
+        SettingOptionItem {
+            id: "bitblt".into(),
+            name: "BitBlt GDI (Desktop Crop)".into(),
+            desc: "Captura clássica de alto desempenho diretamente do framebuffer do desktop.".into(),
+            is_selected: vcap == "bitblt",
+        },
+    ];
+
+    #[cfg(not(target_os = "windows"))]
+    let vcap_items = vec![
+        SettingOptionItem {
+            id: "auto".into(),
+            name: "Automático (Recomendado)".into(),
+            desc: "Utiliza o seletor nativo do sistema via XDG Desktop Portal e PipeWire.".into(),
+            is_selected: vcap == "auto",
+        },
+        SettingOptionItem {
+            id: "portal".into(),
+            name: "XDG Desktop Portal + PipeWire".into(),
+            desc: "Captura de tela moderna de baixa latência compatível com Wayland e Flatpak.".into(),
+            is_selected: vcap == "portal",
+        },
+        SettingOptionItem {
+            id: "x11".into(),
+            name: "X11 Fallback".into(),
+            desc: "Captura legada direta de tela em sessões gráficas X11.".into(),
+            is_selected: vcap == "x11",
+        },
+    ];
+
+    #[cfg(target_os = "windows")]
+    let aloop_items = vec![
+        SettingOptionItem {
+            id: "auto".into(),
+            name: "Automático (Recomendado)".into(),
+            desc: "Captura com isolamento de processo WASAPI (exclui o kiyora do áudio da stream).".into(),
+            is_selected: aloop == "auto",
+        },
+        SettingOptionItem {
+            id: "wasapi_isolated".into(),
+            name: "WASAPI Process-Loopback Isolado".into(),
+            desc: "Captura nativa que remove vozes dos amigos e sons do kiyora da sua transmissão.".into(),
+            is_selected: aloop == "wasapi_isolated",
+        },
+        SettingOptionItem {
+            id: "cpal".into(),
+            name: "CPAL WASAPI Loopback".into(),
+            desc: "Captura direta do endpoint de saída padrão do sistema operacional.".into(),
+            is_selected: aloop == "cpal",
+        },
+    ];
+
+    #[cfg(not(target_os = "windows"))]
+    let aloop_items = vec![
+        SettingOptionItem {
+            id: "auto".into(),
+            name: "Automático (Recomendado)".into(),
+            desc: "Captura monitor do sink padrão PulseAudio/PipeWire via GStreamer pulsesrc.".into(),
+            is_selected: aloop == "auto",
+        },
+        SettingOptionItem {
+            id: "pulsesrc".into(),
+            name: "GStreamer pulsesrc (Monitor)".into(),
+            desc: "Pipeline GStreamer dedicado conectado ao sink monitor do PipeWire.".into(),
+            is_selected: aloop == "pulsesrc",
+        },
+        SettingOptionItem {
+            id: "cpal".into(),
+            name: "CPAL Audio Loopback".into(),
+            desc: "Captura padrão via interface de áudio CPAL.".into(),
+            is_selected: aloop == "cpal",
+        },
+    ];
+
+    ui.set_video_encoder_options(std::rc::Rc::new(slint::VecModel::from(enc_items)).into());
+    ui.set_video_capture_options(std::rc::Rc::new(slint::VecModel::from(vcap_items)).into());
+    ui.set_audio_loopback_options(std::rc::Rc::new(slint::VecModel::from(aloop_items)).into());
+}
+
+#[cfg(target_os = "windows")]
+pub fn refresh_stream_capture_status(ui: &AppWindow) {
+    let text = i18n_ui::ui_text();
+    let value = crate::screen_capture::gpu_capture::status().map(|(gpu, backend)| {
+        let path = if crate::screen_capture::gpu_tx::active() { text.gpu_path } else { text.gpu_compat_path };
+        format!("{}: {} · {} · {}", text.gpu_capture_now, gpu, backend, path)
+    }).unwrap_or_default();
+    ui.set_stream_capture_status(value.into());
+}
+
+pub fn populate_voice_processing_settings(ui: &AppWindow) {
+    let ns = video_settings::get_noise_suppression();
+    let aec = video_settings::get_echo_cancellation();
+    let agc = video_settings::get_automatic_gain_control();
+
+    ui.set_echo_cancellation(aec);
+    ui.set_automatic_gain_control(agc);
+
+    let lang = i18n::load_persisted_language_config();
+    let (adv_name, adv_desc, std_name, std_desc, off_name, off_desc) = match lang {
+        i18n::Language::English => (
+            "Advanced Suppression",
+            "Deep neural network background noise removal and transient filtering.",
+            "Standard (RNNoise)",
+            "Classic recurrent neural network noise reduction.",
+            "Disabled (Default)",
+            "No noise suppression applied to microphone."
+        ),
+        i18n::Language::Spanish => (
+            "Supresión avanzada",
+            "Supresión por red neuronal profunda y filtrado de transientes.",
+            "Estándar (RNNoise)",
+            "Reducción de ruido clásica basada en red neuronal recurrente.",
+            "Desactivado (Predeterminado)",
+            "Sin procesamiento de supresión de ruido en el micrófono."
+        ),
+        _ => (
+            "Supressão Avançada",
+            "Supressão por rede neural profunda e filtragem de transientes.",
+            "Padrão (RNNoise)",
+            "Redução de ruído clássica baseada em rede neural recorrente.",
+            "Desativado (Padrão)",
+            "Sem processamento de supressão de ruído no microfone."
+        ),
+    };
+
+    let ns_items = vec![
+        SettingOptionItem {
+            id: "advanced".into(),
+            name: adv_name.into(),
+            desc: adv_desc.into(),
+            is_selected: ns == "advanced" || ns == "krisp",
+        },
+        SettingOptionItem {
+            id: "standard".into(),
+            name: std_name.into(),
+            desc: std_desc.into(),
+            is_selected: ns == "standard",
+        },
+        SettingOptionItem {
+            id: "none".into(),
+            name: off_name.into(),
+            desc: off_desc.into(),
+            is_selected: ns == "none" || ns.is_empty(),
+        },
+    ];
+
+    ui.set_noise_suppression_options(std::rc::Rc::new(slint::VecModel::from(ns_items)).into());
+}
+
+pub fn populate_network_proxy_settings(ui: &AppWindow) {
+    let settings = crate::utils::get_network_settings();
+    ui.set_selected_proxy_mode(settings.proxy_mode.clone().into());
+    let cur_host = ui.get_proxy_host_input();
+    if cur_host.trim().is_empty() {
+        ui.set_proxy_host_input(settings.proxy_host.clone().into());
+    }
+    let cur_port = ui.get_proxy_port_input();
+    if cur_port.trim().is_empty() {
+        ui.set_proxy_port_input(settings.proxy_port.to_string().into());
+    }
+    ui.set_proxy_route_media_enabled(settings.route_media);
+
+    let mode_items = vec![
+        SettingOptionItem {
+            id: "off".into(),
+            name: "Desativado (Conexão Direta)".into(),
+            desc: "Conexão direta aos servidores do Discord (Padrão).".into(),
+            is_selected: settings.proxy_mode == "off",
+        },
+        SettingOptionItem {
+            id: "http".into(),
+            name: "Proxy HTTP / HTTPS".into(),
+            desc: "Túnel HTTP CONNECT para redes restritas e proxies.".into(),
+            is_selected: settings.proxy_mode == "http" || settings.proxy_mode == "https",
+        },
+        SettingOptionItem {
+            id: "socks5".into(),
+            name: "Proxy SOCKS5".into(),
+            desc: "Túnel SOCKS5 compatível com Tor, Shadowsocks e SSH.".into(),
+            is_selected: settings.proxy_mode == "socks5",
+        },
+        SettingOptionItem {
+            id: "system".into(),
+            name: "Proxy do Sistema".into(),
+            desc: "Detecta automaticamente o proxy global do sistema.".into(),
+            is_selected: settings.proxy_mode == "system",
+        },
+    ];
+
+    ui.set_proxy_mode_options(std::rc::Rc::new(slint::VecModel::from(mode_items)).into());
+}
+
+
+pub fn get_guild_initials(name: &str) -> String {
+    let words: Vec<&str> = name.split_whitespace().collect();
+    if words.len() >= 2 {
+        words.iter().filter_map(|w| w.chars().next()).take(3).collect::<String>().to_uppercase()
+    } else {
+        name.chars().take(2).collect::<String>().to_uppercase()
+    }
+}
+
+
+#[derive(Clone, Debug, Default)]
+pub struct CommandSuggestionItem {
+    pub name: String,
+    pub desc: String,
+    pub usage: String,
+    pub app_id: String,
+    pub app_name: String,
+    pub cmd_id: String,
+    pub version: String,
+    pub param_name: String,
+    pub param_desc: String,
+    pub is_required: bool,
+}
+
+pub static MASTER_COMMAND_SUGGESTIONS: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<CommandSuggestionItem>>>> = std::sync::OnceLock::new();
+
+pub fn get_master_command_suggestions() -> Arc<std::sync::Mutex<Vec<CommandSuggestionItem>>> {
+    MASTER_COMMAND_SUGGESTIONS.get_or_init(|| {
+        Arc::new(std::sync::Mutex::new(vec![
+            CommandSuggestionItem {
+                name: "/play".to_string(),
+                desc: "Tocar música ou adicionar à fila".to_string(),
+                usage: "/play <query>".to_string(),
+                app_id: "".to_string(),
+                app_name: "Música".to_string(),
+                cmd_id: "".to_string(),
+                version: "".to_string(),
+                param_name: "query".to_string(),
+                param_desc: "Nome da música ou link do YouTube/Spotify".to_string(),
+                is_required: true,
+            },
+            CommandSuggestionItem {
+                name: "/skip".to_string(),
+                desc: "Pular para a próxima música".to_string(),
+                usage: "/skip".to_string(),
+                app_id: "".to_string(),
+                app_name: "Música".to_string(),
+                cmd_id: "".to_string(),
+                version: "".to_string(),
+                param_name: "".to_string(),
+                param_desc: "".to_string(),
+                is_required: false,
+            },
+            CommandSuggestionItem {
+                name: "/stop".to_string(),
+                desc: "Parar reprodução e limpar a fila".to_string(),
+                usage: "/stop".to_string(),
+                app_id: "".to_string(),
+                app_name: "Música".to_string(),
+                cmd_id: "".to_string(),
+                version: "".to_string(),
+                param_name: "".to_string(),
+                param_desc: "".to_string(),
+                is_required: false,
+            },
+            CommandSuggestionItem {
+                name: "/pause".to_string(),
+                desc: "Pausar a reprodução atual".to_string(),
+                usage: "/pause".to_string(),
+                app_id: "".to_string(),
+                app_name: "Música".to_string(),
+                cmd_id: "".to_string(),
+                version: "".to_string(),
+                param_name: "".to_string(),
+                param_desc: "".to_string(),
+                is_required: false,
+            },
+            CommandSuggestionItem {
+                name: "/resume".to_string(),
+                desc: "Retomar a reprodução pausada".to_string(),
+                usage: "/resume".to_string(),
+                app_id: "".to_string(),
+                app_name: "Música".to_string(),
+                cmd_id: "".to_string(),
+                version: "".to_string(),
+                param_name: "".to_string(),
+                param_desc: "".to_string(),
+                is_required: false,
+            },
+            CommandSuggestionItem {
+                name: "/queue".to_string(),
+                desc: "Ver a fila de músicas atual".to_string(),
+                usage: "/queue".to_string(),
+                app_id: "".to_string(),
+                app_name: "Música".to_string(),
+                cmd_id: "".to_string(),
+                version: "".to_string(),
+                param_name: "".to_string(),
+                param_desc: "".to_string(),
+                is_required: false,
+            },
+            CommandSuggestionItem {
+                name: "/nowplaying".to_string(),
+                desc: "Exibir a música tocando agora".to_string(),
+                usage: "/nowplaying".to_string(),
+                app_id: "".to_string(),
+                app_name: "Música".to_string(),
+                cmd_id: "".to_string(),
+                version: "".to_string(),
+                param_name: "".to_string(),
+                param_desc: "".to_string(),
+                is_required: false,
+            },
+            CommandSuggestionItem {
+                name: "/247".to_string(),
+                desc: "Manter o bot 24/7 conectado no canal de voz".to_string(),
+                usage: "/247".to_string(),
+                app_id: "".to_string(),
+                app_name: "Música".to_string(),
+                cmd_id: "".to_string(),
+                version: "".to_string(),
+                param_name: "".to_string(),
+                param_desc: "".to_string(),
+                is_required: false,
+            },
+        ]))
+    }).clone()
+}
+
+pub async fn load_guild_command_index(
+    http: &DiscordHttpClient,
+    app_weak: slint::Weak<AppWindow>,
+    guild_id: &str,
+) {
+    if guild_id.is_empty() || guild_id == "@me" {
+        return;
+    }
+    match http.get_guild_application_command_index(guild_id).await {
+        Ok(data) => {
+            // Build map of application_id -> Application / Bot Name
+            let mut app_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            if let Some(apps) = data["applications"].as_array() {
+                for app in apps {
+                    let app_id = app["id"].as_str().unwrap_or("").to_string();
+                    let app_name = app["name"].as_str()
+                        .or_else(|| app["bot"]["global_name"].as_str())
+                        .or_else(|| app["bot"]["username"].as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !app_id.is_empty() && !app_name.is_empty() {
+                        app_names.insert(app_id, app_name);
+                    }
+                }
+            }
+
+            if let Some(cmds) = data["application_commands"].as_array() {
+                let mut items: Vec<CommandSuggestionItem> = Vec::new();
+                for cmd in cmds {
+                    let name = cmd["name"].as_str().unwrap_or("");
+                    if name.is_empty() { continue; }
+                    let desc = cmd["description"].as_str().unwrap_or("");
+                    let app_id = cmd["application_id"].as_str().unwrap_or("");
+                    let cmd_id = cmd["id"].as_str().unwrap_or("");
+                    let version = cmd["version"].as_str().unwrap_or("");
+                    let app_name = app_names.get(app_id).cloned().unwrap_or_else(|| {
+                        if !app_id.is_empty() { "Bot".to_string() } else { String::new() }
+                    });
+                    
+                    let mut param_name = String::new();
+                    let mut param_desc = String::new();
+                    let mut is_required = false;
+                    
+                    if let Some(opts) = cmd["options"].as_array() {
+                        // Find first required option, or fallback to first option if present
+                        let required_opt = opts.iter().find(|o| o["required"].as_bool().unwrap_or(false));
+                        if let Some(opt) = required_opt {
+                            param_name = opt["name"].as_str().unwrap_or("").to_string();
+                            param_desc = opt["description"].as_str().unwrap_or("").to_string();
+                            is_required = true;
+                        } else if let Some(opt) = opts.first() {
+                            // Option is optional — do not force a required parameter pill
+                            let opt_name = opt["name"].as_str().unwrap_or("");
+                            let opt_desc = opt["description"].as_str().unwrap_or("");
+                            param_desc = format!("Opcional: {} ({})", opt_name, opt_desc);
+                            is_required = false;
+                        }
+                    }
+                    
+                    let usage = if param_name.is_empty() {
+                        format!("/{}", name)
+                    } else if is_required {
+                        format!("/{} <{}>", name, param_name)
+                    } else {
+                        format!("/{} [{}]", name, param_name)
+                    };
+                    
+                    items.push(CommandSuggestionItem {
+                        name: format!("/{}", name),
+                        desc: desc.to_string(),
+                        usage,
+                        app_id: app_id.to_string(),
+                        app_name,
+                        cmd_id: cmd_id.to_string(),
+                        version: version.to_string(),
+                        param_name,
+                        param_desc,
+                        is_required,
+                    });
+                }
+                
+                if !items.is_empty() {
+                    let count = items.len();
+                    if let Ok(mut master) = get_master_command_suggestions().lock() {
+                        master.clear();
+                        master.extend(items.clone());
+                    }
+
+                    let slint_suggestions: Vec<CommandSuggestion> = items.into_iter().map(|item| CommandSuggestion {
+                        name: item.name.into(),
+                        desc: item.desc.into(),
+                        usage: item.usage.into(),
+                        app_id: item.app_id.into(),
+                        app_name: item.app_name.into(),
+                        cmd_id: item.cmd_id.into(),
+                        version: item.version.into(),
+                        param_name: item.param_name.into(),
+                        param_desc: item.param_desc.into(),
+                        is_required: item.is_required,
+                    }).collect();
+
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = app_weak.upgrade() {
+                            let model = std::rc::Rc::new(slint::VecModel::from(slint_suggestions));
+                            ui.set_command_suggestions(model.into());
+                            info!("✅ Carregados {} comandos inteligentes reais dos bots do servidor com identificadores!", count);
+                        }
+                    });
+                }
+            }
+        }
+        Err(e) => {
+            warn!("Não foi possível carregar o índice de comandos do servidor {}: {}", guild_id, e);
+        }
+    }
+}
+
+pub fn map_message_lines(lines: &[gateway::MessageLineData], channel_id: &str, app_weak: &slint::Weak<AppWindow>) -> slint::ModelRc<MessageLine> {
+    let emoji_mgr = emoji_cache::get_emoji_cache();
+    let slint_lines: Vec<MessageLine> = lines.iter().map(|line| {
+        let slint_blocks: Vec<MessageBlock> = line.blocks.iter().map(|b| {
+            let emoji_img = if b.is_emoji {
+                if let Some(img) = emoji_mgr.get(&b.emoji_id) {
+                    img
+                } else {
+                    emoji_mgr.fetch_priority_async(&b.emoji_id, channel_id, app_weak.clone());
+                    slint::Image::default()
+                }
+            } else {
+                slint::Image::default()
+            };
+
+            MessageBlock {
+                text: b.text.clone().into(),
+                is_link: b.is_link,
+                is_command: b.is_command,
+                is_emoji: b.is_emoji,
+                emoji_id: b.emoji_id.clone().into(),
+                emoji_img,
+                url: b.url.clone().into(),
+                command_name: b.command_name.clone().into(),
+            }
+        }).collect();
+        MessageLine {
+            blocks: slint::ModelRc::from(std::rc::Rc::new(slint::VecModel::from(slint_blocks))),
+        }
+    }).collect();
+    slint::ModelRc::from(std::rc::Rc::new(slint::VecModel::from(slint_lines)))
+}
+
+pub fn map_message_attachments(
+    attachments: &[gateway::MessageAttachmentData],
+    app_weak: &slint::Weak<AppWindow>,
+) -> slint::ModelRc<MessageAttachment> {
+    let att_cache = attachment_cache::get_attachment_cache();
+    let slint_atts: Vec<MessageAttachment> = attachments.iter().map(|a| {
+        let (is_downloaded, full_img) = if let Some(img) = att_cache.get_full(&a.id, &a.filename) {
+            (true, img)
+        } else {
+            (false, slint::Image::default())
+        };
+
+        let preview_img = if a.is_image && !is_downloaded {
+            if let Some(p) = att_cache.get_preview(&a.id) {
+                p
+            } else {
+                att_cache.fetch_preview_async(&a.id, &a.proxy_url, app_weak.clone());
+                slint::Image::default()
+            }
+        } else {
+            slint::Image::default()
+        };
+
+        let (width, height) = if a.width > 0 && a.height > 0 {
+            (a.width, a.height)
+        } else if is_downloaded {
+            let sz = full_img.size();
+            (sz.width as i32, sz.height as i32)
+        } else {
+            (a.width, a.height)
+        };
+
+        MessageAttachment {
+            id: a.id.clone().into(),
+            filename: a.filename.clone().into(),
+            url: a.url.clone().into(),
+            proxy_url: a.proxy_url.clone().into(),
+            size_str: a.size_str.clone().into(),
+            width,
+            height,
+            is_image: a.is_image,
+            is_downloaded,
+            is_loading: false,
+            full_img,
+            preview_img,
+        }
+    }).collect();
+    slint::ModelRc::from(std::rc::Rc::new(slint::VecModel::from(slint_atts)))
+}
+
+pub fn map_message_buttons(
+    buttons: &[gateway::MessageButtonData],
+    channel_id: &str,
+    app_weak: &slint::Weak<AppWindow>,
+) -> slint::ModelRc<MessageButton> {
+    let emoji_mgr = emoji_cache::get_emoji_cache();
+    let slint_buttons: Vec<MessageButton> = buttons.iter().map(|b| {
+        let emoji_img = if !b.emoji_id.is_empty() {
+            if let Some(img) = emoji_mgr.get(&b.emoji_id) {
+                img
+            } else {
+                emoji_mgr.fetch_priority_async(&b.emoji_id, channel_id, app_weak.clone());
+                slint::Image::default()
+            }
+        } else {
+            slint::Image::default()
+        };
+
+        MessageButton {
+            label: b.label.clone().into(),
+            url: b.url.clone().into(),
+            emoji: b.emoji.clone().into(),
+            emoji_id: b.emoji_id.clone().into(),
+            emoji_img,
+            style_type: b.style_type,
+            is_disabled: b.is_disabled,
+        }
+    }).collect();
+    slint::ModelRc::from(std::rc::Rc::new(slint::VecModel::from(slint_buttons)))
+}
+
+
+pub fn trim_process_memory() {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use windows_sys::Win32::System::ProcessStatus::K32EmptyWorkingSet;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        K32EmptyWorkingSet(GetCurrentProcess());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        trim_memory_if_linux();
+    }
+}
+
+
+#[cfg(target_os = "linux")]
+pub fn trim_memory_if_linux() {
+    unsafe {
+        extern "C" {
+            pub fn malloc_trim(pad: usize) -> i32;
+            pub fn mi_collect(force: bool);
+        }
+        malloc_trim(0);
+        mi_collect(true);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub fn trim_memory_if_linux() {}
+
+
+/// The sidebar row a row dragged from `from` by `dy` logical pixels lands on: the one under
+/// the dragged row's centre. Heights as drawn in channel_sidebar.slint (4px apart).
+pub fn channel_drop_row(rows: &[ChannelItem], from: usize, dy: f32) -> usize {
+    const SPACING: f32 = 4.0;
+    let height = |r: &ChannelItem| {
+        if r.is_category {
+            if r.has_separator { 36.0 } else { 26.0 }
+        } else if r.is_voice_member {
+            26.0
+        } else {
+            34.0
+        }
+    };
+    if from >= rows.len() {
+        return from;
+    }
+    let mut top = 0.0;
+    let mut tops = Vec::with_capacity(rows.len());
+    for r in rows {
+        tops.push(top);
+        top += height(r) + SPACING;
+    }
+    let centre = tops[from] + height(&rows[from]) / 2.0 + dy;
+    tops.iter().rposition(|&t| t <= centre).unwrap_or(0)
+}
+
+pub fn build_ui_channels(
+    channels_data: &[ChannelData],
+    collapsed_cats: &std::collections::HashSet<String>,
+) -> Vec<ChannelItem> {
+    let mut ui_channels: Vec<ChannelItem> = Vec::new();
+    let mut category_count = 0;
+    for ch in channels_data {
+        if ch.is_category {
+            category_count += 1;
+            let is_collapsed = collapsed_cats.contains(&ch.id);
+            let has_separator = category_count > 1;
+            ui_channels.push(ChannelItem {
+                id: ch.id.clone().into(),
+                name: crate::utils::styled_text::plain_display_name(&ch.name).as_ref().into(),
+                is_voice: false,
+                voice_count: 0,
+                is_voice_member: false,
+                parent_channel_id: "".into(),
+                avatar_text: "".into(),
+                avatar_url: "".into(),
+                avatar_slot: 0,
+                is_category: true,
+                has_parent: false,
+                is_collapsed,
+                has_separator,
+                unread_count: 0,
+                ..crate::ui::helpers::channel_emoji_fields(&crate::utils::styled_text::plain_display_name(&ch.name))
+            });
+        } else {
+            if let Some(ref pid) = ch.parent_id {
+                if collapsed_cats.contains(pid) {
+                    continue;
+                }
+            }
+            let voice_participants = if ch.is_voice {
+                gateway::get_voice_channel_participants(&ch.id)
+            } else {
+                Vec::new()
+            };
+            let vcount = voice_participants.len() as i32;
+            ui_channels.push(ChannelItem {
+                id: ch.id.clone().into(),
+                name: crate::utils::styled_text::plain_display_name(&ch.name).as_ref().into(),
+                is_voice: ch.is_voice,
+                voice_count: vcount,
+                is_voice_member: false,
+                parent_channel_id: "".into(),
+                avatar_text: "".into(),
+                avatar_url: "".into(),
+                avatar_slot: 0,
+                is_category: false,
+                has_parent: ch.parent_id.is_some(),
+                is_collapsed: false,
+                has_separator: false,
+                unread_count: 0,
+                ..crate::ui::helpers::channel_emoji_fields(&crate::utils::styled_text::plain_display_name(&ch.name))
+            });
+
+            for (user_id, name) in voice_participants {
+                let avatar_url = gateway::get_user_avatar_url(user_id);
+                let avatar_text: String = name
+                    .split_whitespace()
+                    .filter_map(|part| part.chars().next())
+                    .take(2)
+                    .flat_map(char::to_uppercase)
+                    .collect();
+                ui_channels.push(ChannelItem {
+                    id: format!("voice-member:{}:{}", ch.id, user_id).into(),
+                    name: crate::utils::styled_text::plain_display_name(&name).as_ref().into(),
+                    is_voice: false,
+                    voice_count: 0,
+                    is_voice_member: true,
+                    parent_channel_id: ch.id.clone().into(),
+                    avatar_text: avatar_text.into(),
+                    avatar_slot: crate::utils::avatar_cache::get_avatar_cache().slot_for(&avatar_url),
+                    avatar_url: avatar_url.into(),
+                    is_category: false,
+                    has_parent: ch.parent_id.is_some(),
+                    is_collapsed: false,
+                    has_separator: false,
+                    unread_count: 0,
+                    ..Default::default()
+                });
+            }
+        }
+    }
+    ui_channels
+}
+
+
+#[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
+pub fn set_dark_titlebar_color(_hwnd: isize) {}
+
+#[cfg(target_os = "windows")]
+pub fn set_dark_titlebar_color(hwnd: isize) {
+    use windows_sys::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    };
+    let dark_mode: u32 = 1;
+    unsafe {
+        // Attribute 20 (Win11 / Win10 20H1+)
+        let _ = DwmSetWindowAttribute(
+            hwnd as _,
+            DWMWA_USE_IMMERSIVE_DARK_MODE as _,
+            &dark_mode as *const u32 as _,
+            std::mem::size_of::<u32>() as u32,
+        );
+
+        // Attribute 19 (older Win10 1903-1909 builds)
+        let _ = DwmSetWindowAttribute(
+            hwnd as _,
+            19,
+            &dark_mode as *const u32 as _,
+            std::mem::size_of::<u32>() as u32,
+        );
+
+        // Header color #111214 (BGR COLORREF: 0x00141211)
+        let caption_color: u32 = 0x00141211;
+        let _ = DwmSetWindowAttribute(
+            hwnd as _,
+            DWMWA_CAPTION_COLOR as _,
+            &caption_color as *const u32 as _,
+            std::mem::size_of::<u32>() as u32,
+        );
+
+        // Header text color White #FFFFFF (BGR COLORREF: 0x00FFFFFF)
+        let text_color: u32 = 0x00FFFFFF;
+        let _ = DwmSetWindowAttribute(
+            hwnd as _,
+            DWMWA_TEXT_COLOR as _,
+            &text_color as *const u32 as _,
+            std::mem::size_of::<u32>() as u32,
+        );
+    }
+}
+
+
+#[cfg(target_os = "linux")]
+pub fn set_linux_window_keep_above(is_pinned: bool) {
+    let pin_val = if is_pinned { "true" } else { "false" };
+    let script_code = format!(
+        "var list = workspace.windowList ? workspace.windowList() : (workspace.clientList ? workspace.clientList() : []);\nfor (var i = 0; i < list.length; ++i) {{\n    var w = list[i];\n    if (w.caption.indexOf(\"Transmiss\\u00e3o Desanexada\") !== -1 || (w.caption.indexOf(\"kiyora\") !== -1 && w.caption.indexOf(\"Ultra-Lightweight\") === -1)) {{\n        w.keepAbove = {};\n    }}\n}}\n",
+        pin_val
+    );
+
+    let temp_base = std::env::var("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let script_path_buf = temp_base.join(format!("kiyora_pin_{}.js", std::process::id()));
+    let script_path = script_path_buf.to_string_lossy().to_string();
+    if std::fs::write(&script_path, script_code).is_ok() {
+        let plugin_name = format!("kiyora_pin_{}", std::process::id());
+        let output = std::process::Command::new("busctl")
+            .args(&[
+                "--user",
+                "call",
+                "org.kde.KWin",
+                "/Scripting",
+                "org.kde.kwin.Scripting",
+                "loadScript",
+                "ss",
+                &script_path,
+                &plugin_name,
+            ])
+            .output();
+
+        if let Ok(out) = output {
+            let out_str = String::from_utf8_lossy(&out.stdout);
+            if let Some(id_str) = out_str.trim().split_whitespace().last() {
+                if let Ok(script_id) = id_str.parse::<i32>() {
+                    let script_obj = format!("/Scripting/Script{}", script_id);
+                    let _ = std::process::Command::new("busctl")
+                        .args(&["--user", "call", "org.kde.KWin", &script_obj, "org.kde.kwin.Script", "run"])
+                        .output();
+                    let _ = std::process::Command::new("busctl")
+                        .args(&["--user", "call", "org.kde.KWin", &script_obj, "org.kde.kwin.Script", "stop"])
+                        .output();
+                    let _ = std::process::Command::new("busctl")
+                        .args(&["--user", "call", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "unloadScript", "s", &plugin_name])
+                        .output();
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&script_path);
+    }
+}
+
+#[cfg(test)]
+mod hidden_activity_tests {
+    use super::*;
+
+    #[test]
+    fn a_dragged_channel_lands_on_the_row_under_its_centre() {
+        let row = |cat: bool, member: bool| ChannelItem { is_category: cat, is_voice_member: member, ..Default::default() };
+        // category 26 | text 34 | text 34 | voice 34 | member 26 | text 34   (4px apart)
+        let rows = [row(true, false), row(false, false), row(false, false), row(false, false), row(false, true), row(false, false)];
+        assert_eq!(channel_drop_row(&rows, 1, 0.0), 1);
+        assert_eq!(channel_drop_row(&rows, 1, 25.0), 2);
+        assert_eq!(channel_drop_row(&rows, 1, 60.0), 3);
+        assert_eq!(channel_drop_row(&rows, 5, -70.0), 3);
+        assert_eq!(channel_drop_row(&rows, 1, -500.0), 0);
+        assert_eq!(channel_drop_row(&rows, 1, 5000.0), 5);
+    }
+
+    #[test]
+    fn hidden_activity_keeps_one_entry_per_channel_in_last_activity_order() {
+        let _ = take_hidden_channel_activity();
+        record_hidden_channel_activity("a", 1);
+        record_hidden_channel_activity("b", 1);
+        record_hidden_channel_activity("a", 1);
+        record_hidden_channel_activity("c", 0);
+        assert_eq!(
+            take_hidden_channel_activity(),
+            vec![("b".to_string(), 1), ("a".to_string(), 2), ("c".to_string(), 0)]
+        );
+        assert!(take_hidden_channel_activity().is_empty());
+    }
+}
+
+const CHANNEL_EMOJI_SLOTS: usize = 128;
+
+/// Window and image pool of the channel list's emoji. `ChannelItem` rows are built off
+/// the UI thread too, and an image cannot cross threads, so a row holds a slot number
+/// and the images live in `channel_emoji_pool`, filled on the UI thread.
+static CHANNEL_EMOJI_APP: std::sync::Mutex<Option<slint::Weak<AppWindow>>> = std::sync::Mutex::new(None);
+static CHANNEL_EMOJI_SLOT_OF: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, i32>>> =
+    std::sync::OnceLock::new();
+
+/// Must run on the UI thread: installs the image pool.
+pub fn set_channel_emoji_app(app: slint::Weak<AppWindow>) {
+    if let Some(ui) = app.upgrade() {
+        let pool = std::rc::Rc::new(slint::VecModel::from(vec![slint::Image::default(); CHANNEL_EMOJI_SLOTS]));
+        ui.set_channel_emoji_pool(pool.into());
+    }
+    if let Ok(mut slot) = CHANNEL_EMOJI_APP.lock() {
+        *slot = Some(app);
+    }
+}
+
+/// Channel names often start with an emoji. No loaded font draws emoji in colour,
+/// so they showed as grey outlines; the chat already draws them as Twemoji images
+/// from the emoji cache, and the channel list now does the same. Returns the
+/// emoji fields of a `ChannelItem` (the rest default); a name without a leading
+/// emoji keeps them empty and is drawn as text.
+pub fn channel_emoji_fields(name: &str) -> ChannelItem {
+    let trimmed = name.trim_start();
+    let Some((0, len, _, emoji_id)) = gateway::formatting::find_next_unicode_emoji(trimmed) else {
+        return ChannelItem::default();
+    };
+    let (slot, is_new) = {
+        let mut slots = CHANNEL_EMOJI_SLOT_OF.get_or_init(Default::default).lock().unwrap();
+        match slots.get(&emoji_id) {
+            Some(slot) => (*slot, false),
+            None if slots.len() < CHANNEL_EMOJI_SLOTS => {
+                let slot = slots.len() as i32;
+                slots.insert(emoji_id.clone(), slot);
+                (slot, true)
+            }
+            // Pool full: this name keeps its emoji as text.
+            None => return ChannelItem::default(),
+        }
+    };
+    if is_new {
+        let app = CHANNEL_EMOJI_APP.lock().ok().and_then(|a| a.clone());
+        let id = emoji_id.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(app) = app else { return };
+            let emoji_mgr = emoji_cache::get_emoji_cache();
+            match emoji_mgr.get(&id) {
+                Some(img) => {
+                    if let Some(ui) = app.upgrade() {
+                        refresh_channel_emoji(&ui, &id, &img);
+                    }
+                }
+                None => emoji_mgr.fetch_priority_async(&id, "", app),
+            }
+        });
+    }
+    ChannelItem {
+        label: trimmed[len..].trim_start().into(),
+        emoji_id: emoji_id.into(),
+        emoji_slot: slot,
+        ..Default::default()
+    }
+}
+
+/// Puts `emoji_id`'s image in its pool slot once it is cached.
+pub fn refresh_channel_emoji(ui: &AppWindow, emoji_id: &str, img: &slint::Image) {
+    let slot = CHANNEL_EMOJI_SLOT_OF.get().and_then(|s| s.lock().ok()?.get(emoji_id).copied());
+    if let Some(slot) = slot {
+        let pool = ui.get_channel_emoji_pool();
+        if (slot as usize) < pool.row_count() {
+            pool.set_row_data(slot as usize, img.clone());
+        }
+    }
+}

@@ -1,0 +1,965 @@
+﻿use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU8, Ordering}};
+use std::time::{Duration, Instant};
+use log::info;
+
+pub const KEYBINDS_CONFIG_FILE: &str = ".kiyora_keybinds.json";
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct KeybindsConfig {
+    pub mute_shortcut: String,
+    pub deafen_shortcut: String,
+}
+
+impl Default for KeybindsConfig {
+    fn default() -> Self {
+        Self {
+            mute_shortcut: "Ctrl+Shift+M".to_string(),
+            deafen_shortcut: "Ctrl+Shift+D".to_string(),
+        }
+    }
+}
+
+pub fn load_persisted_keybinds_config() -> KeybindsConfig {
+    if let Ok(data) = std::fs::read_to_string(KEYBINDS_CONFIG_FILE) {
+        if let Ok(cfg) = serde_json::from_str::<KeybindsConfig>(&data) {
+            return cfg;
+        }
+    }
+    KeybindsConfig::default()
+}
+
+pub fn save_persisted_keybinds_config(cfg: &KeybindsConfig) {
+    if let Ok(json) = serde_json::to_string_pretty(cfg) {
+        let _ = std::fs::write(KEYBINDS_CONFIG_FILE, json);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyCombo {
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub vkey: i32,
+    pub display: String,
+}
+
+impl KeyCombo {
+    pub fn parse(s: &str) -> Option<Self> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("None") || trimmed.eq_ignore_ascii_case("Desativado") {
+            return None;
+        }
+
+        let parts: Vec<&str> = trimmed.split('+').map(|p| p.trim()).collect();
+        let mut ctrl = false;
+        let mut shift = false;
+        let mut alt = false;
+        let mut key_part = "";
+
+        for p in parts {
+            if p.eq_ignore_ascii_case("ctrl") || p.eq_ignore_ascii_case("control") {
+                ctrl = true;
+            } else if p.eq_ignore_ascii_case("shift") {
+                shift = true;
+            } else if p.eq_ignore_ascii_case("alt") {
+                alt = true;
+            } else {
+                key_part = p;
+            }
+        }
+
+        if key_part.is_empty() {
+            return None;
+        }
+
+        let vkey = name_to_vkey(key_part)?;
+        let display = format_combo_display(ctrl, shift, alt, key_part);
+
+        Some(Self {
+            ctrl,
+            shift,
+            alt,
+            vkey,
+            display,
+        })
+    }
+}
+
+pub fn format_combo_display(ctrl: bool, shift: bool, alt: bool, key_name: &str) -> String {
+    let mut parts = Vec::new();
+    if ctrl { parts.push("Ctrl"); }
+    if shift { parts.push("Shift"); }
+    if alt { parts.push("Alt"); }
+    let upper = key_name.to_uppercase();
+    parts.push(&upper);
+    parts.join("+")
+}
+
+pub fn name_to_vkey(name: &str) -> Option<i32> {
+    let upper = name.to_uppercase();
+    match upper.as_str() {
+        // Mouse buttons (the left one is never a shortcut: every click would fire it).
+        "MOUSE2" | "MOUSE 2" | "M2" => Some(0x02),
+        "MOUSE3" | "MOUSE 3" | "M3" | "MIDDLECLICK" => Some(0x04),
+        "MOUSE4" | "MOUSE 4" | "M4" => Some(0x05),
+        "MOUSE5" | "MOUSE 5" | "M5" => Some(0x06),
+        "A" => Some(0x41), "B" => Some(0x42), "C" => Some(0x43), "D" => Some(0x44),
+        "E" => Some(0x45), "F" => Some(0x46), "G" => Some(0x47), "H" => Some(0x48),
+        "I" => Some(0x49), "J" => Some(0x4A), "K" => Some(0x4B), "L" => Some(0x4C),
+        "M" => Some(0x4D), "N" => Some(0x4E), "O" => Some(0x4F), "P" => Some(0x50),
+        "Q" => Some(0x51), "R" => Some(0x52), "S" => Some(0x53), "T" => Some(0x54),
+        "U" => Some(0x55), "V" => Some(0x56), "W" => Some(0x57), "X" => Some(0x58),
+        "Y" => Some(0x59), "Z" => Some(0x5A),
+        "0" => Some(0x30), "1" => Some(0x31), "2" => Some(0x32), "3" => Some(0x33),
+        "4" => Some(0x34), "5" => Some(0x35), "6" => Some(0x36), "7" => Some(0x37),
+        "8" => Some(0x38), "9" => Some(0x39),
+        "F1" => Some(0x70), "F2" => Some(0x71), "F3" => Some(0x72), "F4" => Some(0x73),
+        "F5" => Some(0x74), "F6" => Some(0x75), "F7" => Some(0x76), "F8" => Some(0x77),
+        "F9" => Some(0x78), "F10" => Some(0x79), "F11" => Some(0x7A), "F12" => Some(0x7B),
+        "SPACE" | "ESPAÇO" => Some(0x20),
+        "TAB" => Some(0x09),
+        "ESCAPE" | "ESC" => Some(0x1B),
+        "INSERT" | "INS" => Some(0x2D),
+        "DELETE" | "DEL" => Some(0x2E),
+        "HOME" => Some(0x24),
+        "END" => Some(0x23),
+        "PAGEUP" | "PGUP" => Some(0x21),
+        "PAGEDOWN" | "PGDN" => Some(0x22),
+        "NUMPAD0" | "NUM0" => Some(0x60),
+        "NUMPAD1" | "NUM1" => Some(0x61),
+        "NUMPAD2" | "NUM2" => Some(0x62),
+        "NUMPAD3" | "NUM3" => Some(0x63),
+        "NUMPAD4" | "NUM4" => Some(0x64),
+        "NUMPAD5" | "NUM5" => Some(0x65),
+        "NUMPAD6" | "NUM6" => Some(0x66),
+        "NUMPAD7" | "NUM7" => Some(0x67),
+        "NUMPAD8" | "NUM8" => Some(0x68),
+        "NUMPAD9" | "NUM9" => Some(0x69),
+        "NUMPAD_MULTIPLY" | "NUM*" => Some(0x6A),
+        "NUMPAD_ADD" | "NUM+" => Some(0x6B),
+        "NUMPAD_SUBTRACT" | "NUM-" => Some(0x6D),
+        "NUMPAD_DIVIDE" | "NUM/" => Some(0x6F),
+        "UP" => Some(0x26),
+        "DOWN" => Some(0x28),
+        "LEFT" => Some(0x25),
+        "RIGHT" => Some(0x27),
+        "CAPSLOCK" | "CAPS" => Some(0x14),
+        "PAUSE" => Some(0x13),
+        "SCROLLLOCK" => Some(0x91),
+        "TILDE" | "~" | "`" => Some(0xC0),
+        "-" | "MINUS" => Some(0xBD),
+        "=" | "PLUS" => Some(0xBB),
+        "[" => Some(0xDB),
+        "]" => Some(0xDD),
+        ";" => Some(0xBA),
+        "'" => Some(0xDE),
+        "," => Some(0xBC),
+        "." => Some(0xBE),
+        "/" => Some(0xBF),
+        "\\" => Some(0xDC),
+        _ => None,
+    }
+}
+
+pub fn vkey_to_name(vkey: i32) -> &'static str {
+    match vkey {
+        0x02 => "Mouse 2",
+        0x04 => "Mouse 3",
+        0x05 => "Mouse 4",
+        0x06 => "Mouse 5",
+        0x41 => "A", 0x42 => "B", 0x43 => "C", 0x44 => "D",
+        0x45 => "E", 0x46 => "F", 0x47 => "G", 0x48 => "H",
+        0x49 => "I", 0x4A => "J", 0x4B => "K", 0x4C => "L",
+        0x4D => "M", 0x4E => "N", 0x4F => "O", 0x50 => "P",
+        0x51 => "Q", 0x52 => "R", 0x53 => "S", 0x54 => "T",
+        0x55 => "U", 0x56 => "V", 0x57 => "W", 0x58 => "X",
+        0x59 => "Y", 0x5A => "Z",
+        0x30 => "0", 0x31 => "1", 0x32 => "2", 0x33 => "3",
+        0x34 => "4", 0x35 => "5", 0x36 => "6", 0x37 => "7",
+        0x38 => "8", 0x39 => "9",
+        0x70 => "F1", 0x71 => "F2", 0x72 => "F3", 0x73 => "F4",
+        0x74 => "F5", 0x75 => "F6", 0x76 => "F7", 0x77 => "F8",
+        0x78 => "F9", 0x79 => "F10", 0x7A => "F11", 0x7B => "F12",
+        0x20 => "Space",
+        0x09 => "Tab",
+        0x1B => "Esc",
+        0x2D => "Insert",
+        0x2E => "Delete",
+        0x24 => "Home",
+        0x23 => "End",
+        0x21 => "PageUp",
+        0x22 => "PageDown",
+        0x60 => "NumPad0",
+        0x61 => "NumPad1",
+        0x62 => "NumPad2",
+        0x63 => "NumPad3",
+        0x64 => "NumPad4",
+        0x65 => "NumPad5",
+        0x66 => "NumPad6",
+        0x67 => "NumPad7",
+        0x68 => "NumPad8",
+        0x69 => "NumPad9",
+        0x6A => "NumPad*",
+        0x6B => "NumPad+",
+        0x6D => "NumPad-",
+        0x6F => "NumPad/",
+        0x26 => "Up",
+        0x28 => "Down",
+        0x25 => "Left",
+        0x27 => "Right",
+        0x14 => "CapsLock",
+        0x13 => "Pause",
+        0x91 => "ScrollLock",
+        0xC0 => "~",
+        0xBD => "-",
+        0xBB => "=",
+        0xDB => "[",
+        0xDD => "]",
+        0xBA => ";",
+        0xDE => "'",
+        0xBC => ",",
+        0xBE => ".",
+        0xBF => "/",
+        0xDC => "\\",
+        _ => "Key",
+    }
+}
+
+/// 0 = None, 1 = Recording Mute, 2 = Recording Deafen
+pub static RECORDING_TARGET: AtomicU8 = AtomicU8::new(0);
+
+pub fn start_recording(target: u8) {
+    RECORDING_TARGET.store(target, Ordering::Relaxed);
+    wake_listener();
+}
+
+/// Wakes the Linux listener so it re-masks the mice at once (see `mask_events`).
+fn wake_listener() {
+    #[cfg(target_os = "linux")]
+    unsafe { libc::eventfd_write(*WAKE_FD, 1); }
+}
+
+#[cfg(target_os = "linux")]
+static WAKE_FD: std::sync::LazyLock<i32> = std::sync::LazyLock::new(|| unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) });
+
+/// Virtual keys of the mouse buttons a shortcut can use (right, middle, back, forward).
+pub const MOUSE_BUTTON_VKEYS: [i32; 4] = [0x02, 0x04, 0x05, 0x06];
+
+/// Whether a shortcut uses a mouse button. Raw input has no "buttons only" mode (it would
+/// wake us on every mouse move, up to 1000 times a second while gaming), so the buttons are
+/// read every 30 ms instead, and only while this is true or a shortcut is being recorded.
+pub fn uses_mouse_button(cfg: &KeybindsConfig) -> bool {
+    [&cfg.mute_shortcut, &cfg.deafen_shortcut]
+        .iter()
+        .filter_map(|s| KeyCombo::parse(s))
+        .any(|c| MOUSE_BUTTON_VKEYS.contains(&c.vkey))
+}
+
+pub struct KeybindManager {
+    config: Arc<Mutex<KeybindsConfig>>,
+    is_running: Arc<AtomicBool>,
+}
+
+impl KeybindManager {
+    pub fn new(initial_config: KeybindsConfig) -> Self {
+        Self {
+            config: Arc::new(Mutex::new(initial_config)),
+            is_running: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    pub fn get_config(&self) -> KeybindsConfig {
+        self.config.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn update_config(&self, new_cfg: KeybindsConfig) {
+        save_persisted_keybinds_config(&new_cfg);
+        *self.config.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg;
+        wake_listener();
+    }
+
+    pub fn start_global_listener<FMute, FDeaf, FRecordDone>(
+        &self,
+        on_mute_trigger: FMute,
+        on_deafen_trigger: FDeaf,
+        on_recorded: FRecordDone,
+    ) where
+        FMute: Fn() + Send + Sync + 'static,
+        FDeaf: Fn() + Send + Sync + 'static,
+        FRecordDone: Fn(u8, String) + Send + Sync + 'static,
+    {
+        #[cfg(target_os = "windows")]
+        {
+            let config_arc = Arc::clone(&self.config);
+            let is_running = Arc::clone(&self.is_running);
+
+            std::thread::Builder::new()
+                .name("global-keybinds-listener".to_string())
+                .spawn(move || {
+                    info!("⌨️ [KEYBINDS] Global keybinds listener started successfully");
+                    let mut mute_was_pressed = false;
+                    let mut deafen_was_pressed = false;
+
+                    // Windows VK constants
+                    const VK_CONTROL: i32 = 0x11;
+                    const VK_SHIFT: i32 = 0x10;
+                    const VK_MENU: i32 = 0x12; // Alt
+
+                    let key_now = |vk: i32| -> bool {
+                        unsafe {
+                            (windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk) as u16 & 0x8000) != 0
+                        }
+                    };
+
+                    // Raw keyboard input (delivered even while a game has focus) wakes this
+                    // thread on every key press or release; between keys it sleeps in
+                    // GetMessageW instead of polling the keyboard every 20 ms.
+                    let sink = unsafe { create_raw_keyboard_sink() };
+                    if sink.is_null() {
+                        log::warn!("⌨️ [KEYBINDS] Não foi possível registrar a entrada de teclado; atalhos globais desativados.");
+                        return;
+                    }
+                    let mut msg: windows_sys::Win32::UI::WindowsAndMessaging::MSG = unsafe { std::mem::zeroed() };
+                    let mut mouse_down = [false; MOUSE_BUTTON_VKEYS.len()];
+
+                    while is_running.load(Ordering::Relaxed) {
+                        use windows_sys::Win32::UI::WindowsAndMessaging::{
+                            DispatchMessageW, GetMessageW, MsgWaitForMultipleObjects, PeekMessageW, PM_REMOVE, QS_ALLINPUT, WM_INPUT, WM_QUIT,
+                        };
+                        let watch_mouse = RECORDING_TARGET.load(Ordering::Relaxed) != 0
+                            || uses_mouse_button(&config_arc.lock().unwrap_or_else(|e| e.into_inner()));
+                        let got_message = if watch_mouse {
+                            unsafe {
+                                MsgWaitForMultipleObjects(0, std::ptr::null(), 0, 30, QS_ALLINPUT);
+                                PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0
+                            }
+                        } else {
+                            if unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) } <= 0 {
+                                break;
+                            }
+                            true
+                        };
+                        let event = if got_message {
+                            if msg.message == WM_QUIT {
+                                break;
+                            }
+                            let key = if msg.message == WM_INPUT { unsafe { read_raw_key(msg.lParam) } } else { None };
+                            // DefWindowProc must see WM_INPUT to release the input data.
+                            unsafe { DispatchMessageW(&msg) };
+                            key
+                        } else {
+                            // No key: a mouse button that went down or up since the last look.
+                            MOUSE_BUTTON_VKEYS.iter().zip(mouse_down.iter_mut()).find_map(|(&vk, was)| {
+                                let now = key_now(vk);
+                                (now != *was).then(|| {
+                                    *was = now;
+                                    (vk, now)
+                                })
+                            })
+                        };
+                        if !watch_mouse {
+                            mouse_down = [false; MOUSE_BUTTON_VKEYS.len()];
+                        }
+                        let Some((event_vk, event_down)) = event else { continue };
+
+                        // The async key state may not include the key that woke us yet, so
+                        // that key's state comes from the event itself.
+                        let is_key_down = |vk: i32| -> bool {
+                            if vk == event_vk { event_down } else { key_now(vk) }
+                        };
+
+                        let rec_target = RECORDING_TARGET.load(Ordering::Relaxed);
+                        if rec_target != 0 {
+                            // In recording mode: check if any non-modifier key is pressed
+                            let ctrl = is_key_down(VK_CONTROL);
+                            let shift = is_key_down(VK_SHIFT);
+                            let alt = is_key_down(VK_MENU);
+
+                            let candidate_vkeys: &[i32] = &[
+                                // A-Z
+                                0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x4B, 0x4C,
+                                0x4D, 0x4E, 0x4F, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58,
+                                0x59, 0x5A,
+                                // 0-9
+                                0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
+                                // F1-F12
+                                0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B,
+                                // Numpad
+                                0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+                                0x6A, 0x6B, 0x6D, 0x6F,
+                                // Special keys
+                                0x20, 0x09, 0x1B, 0x2D, 0x2E, 0x24, 0x23, 0x21, 0x22,
+                                0x26, 0x28, 0x25, 0x27, 0x14, 0x13, 0x91,
+                                0xC0, 0xBD, 0xBB, 0xDB, 0xDD, 0xBA, 0xDE, 0xBC, 0xBE, 0xBF, 0xDC,
+                                // Mouse buttons (not the left one)
+                                0x02, 0x04, 0x05, 0x06,
+                            ];
+
+                            for &vk in candidate_vkeys {
+                                if is_key_down(vk) {
+                                    // Escape cancels recording
+                                    if vk == 0x1B && !ctrl && !shift && !alt {
+                                        RECORDING_TARGET.store(0, Ordering::Relaxed);
+                                        info!("⌨️ [KEYBINDS] Gravação cancelada via ESC");
+                                        on_recorded(rec_target, String::new());
+                                        // Wait until release
+                                        while key_now(0x1B) {
+                                            std::thread::sleep(Duration::from_millis(30));
+                                        }
+                                        unsafe { discard_pending_raw_input(); }
+                                        break;
+                                    }
+
+                                    let key_name = vkey_to_name(vk);
+                                    let combo_str = format_combo_display(ctrl, shift, alt, key_name);
+                                    info!("⌨️ [KEYBINDS] Gravado com sucesso para target {}: {}", rec_target, combo_str);
+
+                                    // Save new combo
+                                    {
+                                        let mut cfg = config_arc.lock().unwrap_or_else(|e| e.into_inner());
+                                        if rec_target == 1 {
+                                            cfg.mute_shortcut = combo_str.clone();
+                                        } else if rec_target == 2 {
+                                            cfg.deafen_shortcut = combo_str.clone();
+                                        }
+                                        save_persisted_keybinds_config(&cfg);
+                                    }
+
+                                    RECORDING_TARGET.store(0, Ordering::Relaxed);
+                                    on_recorded(rec_target, combo_str);
+
+                                    // Wait until key is released to avoid instant triggering
+                                    while key_now(vk) || key_now(VK_CONTROL) || key_now(VK_SHIFT) || key_now(VK_MENU) {
+                                        std::thread::sleep(Duration::from_millis(30));
+                                    }
+                                    // Key repeats queued while waiting must not fire the new shortcut.
+                                    unsafe { discard_pending_raw_input(); }
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+
+                        // Normal hotkey detection mode
+                        let (mute_combo, deaf_combo) = {
+                            let cfg = config_arc.lock().unwrap_or_else(|e| e.into_inner());
+                            (
+                                KeyCombo::parse(&cfg.mute_shortcut),
+                                KeyCombo::parse(&cfg.deafen_shortcut),
+                            )
+                        };
+
+                        let ctrl_down = is_key_down(VK_CONTROL);
+                        let shift_down = is_key_down(VK_SHIFT);
+                        let alt_down = is_key_down(VK_MENU);
+
+                        // Check Mute
+                        if let Some(ref combo) = mute_combo {
+                            let match_modifiers = (!combo.ctrl || ctrl_down)
+                                && (!combo.shift || shift_down)
+                                && (!combo.alt || alt_down)
+                                && (combo.ctrl == ctrl_down)
+                                && (combo.shift == shift_down)
+                                && (combo.alt == alt_down);
+
+                            let is_pressed = match_modifiers && is_key_down(combo.vkey);
+
+                            if is_pressed && !mute_was_pressed {
+                                info!("🎙️ [KEYBINDS] Atalho Global de Mutar disparado: {}", combo.display);
+                                on_mute_trigger();
+                            }
+                            mute_was_pressed = is_pressed;
+                        } else {
+                            mute_was_pressed = false;
+                        }
+
+                        // Check Deafen
+                        if let Some(ref combo) = deaf_combo {
+                            let match_modifiers = (!combo.ctrl || ctrl_down)
+                                && (!combo.shift || shift_down)
+                                && (!combo.alt || alt_down)
+                                && (combo.ctrl == ctrl_down)
+                                && (combo.shift == shift_down)
+                                && (combo.alt == alt_down);
+
+                            let is_pressed = match_modifiers && is_key_down(combo.vkey);
+
+                            if is_pressed && !deafen_was_pressed {
+                                info!("🎧 [KEYBINDS] Atalho Global de Ensurdecer disparado: {}", combo.display);
+                                on_deafen_trigger();
+                            }
+                            deafen_was_pressed = is_pressed;
+                        } else {
+                            deafen_was_pressed = false;
+                        }
+                    }
+                })
+                .expect("Failed to start global keybinds thread");
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let config_arc = Arc::clone(&self.config);
+            let is_running = Arc::clone(&self.is_running);
+
+            std::thread::Builder::new()
+                .name("global-keybinds-listener".to_string())
+                .spawn(move || {
+                    info!("⌨️ [KEYBINDS] Listener global de atalhos (Linux evdev) iniciado com sucesso");
+                    let mut mute_was_pressed = false;
+                    let mut deafen_was_pressed = false;
+                    let mut last_scan = Instant::now() - Duration::from_secs(10);
+                    let mut kbd_fds: Vec<i32> = Vec::new();
+                    let mut not_keyboards = Vec::new();
+                    let mut watch_mouse = false;
+
+                    while is_running.load(Ordering::Relaxed) {
+                        // Sleep until a keyboard reports an event (or the next device rescan is
+                        // due) instead of reading the key state every 20 ms.
+                        let rescan_in = Duration::from_secs(5).saturating_sub(last_scan.elapsed());
+                        if kbd_fds.is_empty() {
+                            std::thread::sleep(rescan_in);
+                        } else {
+                            wait_for_key_events(&kbd_fds, rescan_in);
+                        }
+
+                        let watch = RECORDING_TARGET.load(Ordering::Relaxed) != 0
+                            || uses_mouse_button(&config_arc.lock().unwrap_or_else(|e| e.into_inner()));
+                        if watch != watch_mouse {
+                            watch_mouse = watch;
+                            for &fd in &kbd_fds { mask_events(fd, watch_mouse); }
+                        }
+                        if kbd_fds.is_empty() || last_scan.elapsed() >= Duration::from_secs(5) {
+                            last_scan = Instant::now();
+                            find_keyboard_devices(&mut kbd_fds, &mut not_keyboards, watch_mouse);
+                            if kbd_fds.is_empty() {
+                                static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                                if !WARNED.swap(true, Ordering::Relaxed) {
+                                    log::warn!("⚠️ [KEYBINDS] Nenhum teclado com permissão de leitura em /dev/input/. Atalhos globais requerem acesso aos dispositivos de entrada: sudo usermod -aG input $USER (e entre na sessão de novo).");
+                                }
+                            }
+                        }
+
+                        if kbd_fds.is_empty() {
+                            continue;
+                        }
+
+                        const EVIOCGKEY_64: u64 = 0x80404518;
+                        let mut global_key_state = [0u8; 64];
+                        let mut valid_fds = Vec::with_capacity(kbd_fds.len());
+                        for fd in kbd_fds {
+                            let mut dev_key_state = [0u8; 64];
+                            let res = unsafe { libc::ioctl(fd, EVIOCGKEY_64 as _, dev_key_state.as_mut_ptr()) };
+                            if res >= 0 {
+                                for i in 0..64 {
+                                    global_key_state[i] |= dev_key_state[i];
+                                }
+                                valid_fds.push(fd);
+                            } else {
+                                unsafe { libc::close(fd); }
+                            }
+                        }
+                        kbd_fds = valid_fds;
+
+                        let is_key_down = |code: u16| -> bool {
+                            let idx = (code as usize) / 8;
+                            let bit = (code as usize) % 8;
+                            if idx < 64 {
+                                (global_key_state[idx] & (1 << bit)) != 0
+                            } else {
+                                false
+                            }
+                        };
+
+                        let ctrl_down = is_key_down(29) || is_key_down(97);   // KEY_LEFTCTRL, KEY_RIGHTCTRL
+                        let shift_down = is_key_down(42) || is_key_down(54);  // KEY_LEFTSHIFT, KEY_RIGHTSHIFT
+                        let alt_down = is_key_down(56) || is_key_down(100);   // KEY_LEFTALT, KEY_RIGHTALT
+
+                        let rec_target = RECORDING_TARGET.load(Ordering::Relaxed);
+                        if rec_target != 0 {
+                            for &evdev_code in CANDIDATE_EVDEV_KEYS {
+                                if is_key_down(evdev_code) {
+                                    if evdev_code == 1 && !ctrl_down && !shift_down && !alt_down {
+                                        RECORDING_TARGET.store(0, Ordering::Relaxed);
+                                        info!("⌨️ [KEYBINDS] Gravação cancelada via ESC");
+                                        on_recorded(rec_target, String::new());
+                                        loop {
+                                            std::thread::sleep(Duration::from_millis(30));
+                                            let mut esc = false;
+                                            for &fd in &kbd_fds {
+                                                let mut s = [0u8; 64];
+                                                if unsafe { libc::ioctl(fd, EVIOCGKEY_64 as _, s.as_mut_ptr()) } >= 0 {
+                                                    if (s[1 / 8] & (1 << (1 % 8))) != 0 {
+                                                        esc = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            if !esc { break; }
+                                        }
+                                        break;
+                                    }
+
+                                    if let Some(vk) = evdev_code_to_vk(evdev_code) {
+                                        let key_name = vkey_to_name(vk);
+                                        let combo_str = format_combo_display(ctrl_down, shift_down, alt_down, key_name);
+                                        info!("⌨️ [KEYBINDS] Gravado com sucesso para target {}: {}", rec_target, combo_str);
+
+                                        {
+                                            let mut cfg = config_arc.lock().unwrap_or_else(|e| e.into_inner());
+                                            if rec_target == 1 {
+                                                cfg.mute_shortcut = combo_str.clone();
+                                            } else if rec_target == 2 {
+                                                cfg.deafen_shortcut = combo_str.clone();
+                                            }
+                                            save_persisted_keybinds_config(&cfg);
+                                        }
+
+                                        RECORDING_TARGET.store(0, Ordering::Relaxed);
+                                        on_recorded(rec_target, combo_str);
+
+                                        // Wait until released
+                                        loop {
+                                            std::thread::sleep(Duration::from_millis(30));
+                                            let mut any_down = false;
+                                            for &fd in &kbd_fds {
+                                                let mut s = [0u8; 64];
+                                                if unsafe { libc::ioctl(fd, EVIOCGKEY_64 as _, s.as_mut_ptr()) } >= 0 {
+                                                    let k_idx = (evdev_code as usize) / 8;
+                                                    let k_bit = (evdev_code as usize) % 8;
+                                                    if (s[k_idx] & (1 << k_bit)) != 0
+                                                        || (s[29 / 8] & (1 << (29 % 8))) != 0
+                                                        || (s[97 / 8] & (1 << (97 % 8))) != 0
+                                                        || (s[42 / 8] & (1 << (42 % 8))) != 0
+                                                        || (s[54 / 8] & (1 << (54 % 8))) != 0
+                                                        || (s[56 / 8] & (1 << (56 % 8))) != 0
+                                                        || (s[100 / 8] & (1 << (100 % 8))) != 0
+                                                    {
+                                                        any_down = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            if !any_down { break; }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+
+                        // Normal hotkey detection mode
+                        let (mute_combo, deaf_combo) = {
+                            let cfg = config_arc.lock().unwrap_or_else(|e| e.into_inner());
+                            (
+                                KeyCombo::parse(&cfg.mute_shortcut),
+                                KeyCombo::parse(&cfg.deafen_shortcut),
+                            )
+                        };
+
+                        // Check Mute
+                        if let Some(ref combo) = mute_combo {
+                            let match_modifiers = (!combo.ctrl || ctrl_down)
+                                && (!combo.shift || shift_down)
+                                && (!combo.alt || alt_down)
+                                && (combo.ctrl == ctrl_down)
+                                && (combo.shift == shift_down)
+                                && (combo.alt == alt_down);
+
+                            let key_pressed = vk_to_evdev_code(combo.vkey).map_or(false, &is_key_down);
+                            let is_pressed = match_modifiers && key_pressed;
+
+                            if is_pressed && !mute_was_pressed {
+                                info!("🎙️ [KEYBINDS] Atalho Global de Mutar disparado: {}", combo.display);
+                                on_mute_trigger();
+                            }
+                            mute_was_pressed = is_pressed;
+                        } else {
+                            mute_was_pressed = false;
+                        }
+
+                        // Check Deafen
+                        if let Some(ref combo) = deaf_combo {
+                            let match_modifiers = (!combo.ctrl || ctrl_down)
+                                && (!combo.shift || shift_down)
+                                && (!combo.alt || alt_down)
+                                && (combo.ctrl == ctrl_down)
+                                && (combo.shift == shift_down)
+                                && (combo.alt == alt_down);
+
+                            let key_pressed = vk_to_evdev_code(combo.vkey).map_or(false, &is_key_down);
+                            let is_pressed = match_modifiers && key_pressed;
+
+                            if is_pressed && !deafen_was_pressed {
+                                info!("🎧 [KEYBINDS] Atalho Global de Ensurdecer disparado: {}", combo.display);
+                                on_deafen_trigger();
+                            }
+                            deafen_was_pressed = is_pressed;
+                        } else {
+                            deafen_was_pressed = false;
+                        }
+                    }
+
+                    for fd in kbd_fds {
+                        unsafe { libc::close(fd); }
+                    }
+                })
+                .expect("Failed to start global keybinds thread no Linux");
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        {
+            let _ = on_mute_trigger;
+            let _ = on_deafen_trigger;
+            let _ = on_recorded;
+            info!("⌨️ [KEYBINDS] Atalhos globais não suportados nativamente nesta plataforma.");
+        }
+    }
+}
+
+/// Blocks until one of the evdev descriptors has input or `timeout` passes, then drains
+/// the pending events (the caller reads the key state with EVIOCGKEY afterwards).
+#[cfg(target_os = "linux")]
+fn wait_for_key_events(fds: &[i32], timeout: Duration) {
+    let mut pollfds: Vec<libc::pollfd> = fds.iter().chain([&*WAKE_FD]).map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect();
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout_ms) };
+    if ready <= 0 {
+        return;
+    }
+    let mut buf = [0u8; 24 * 64]; // struct input_event is 24 bytes on 64-bit
+    for p in &pollfds {
+        if p.revents & libc::POLLIN != 0 {
+            // Non-blocking descriptors: read until EAGAIN.
+            while unsafe { libc::read(p.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) } > 0 {}
+        }
+    }
+}
+
+/// Only events a shortcut can use wake the listener (EVIOCSMASK): the kernel drops motion (EV_REL,
+/// EV_ABS, EV_MSC) and, on mice, every button but Mouse 2-5, and those too unless `watch_mouse`.
+#[cfg(target_os = "linux")]
+fn mask_events(fd: i32, watch_mouse: bool) {
+    #[repr(C)] struct InputMask { ty: u32, size: u32, codes: u64 }
+    let set = |ty: u32, codes: &[u64]| unsafe {
+        libc::ioctl(fd, 0x40104593, &InputMask { ty, size: (codes.len() * 8) as u32, codes: codes.as_ptr() as u64 });
+    };
+    for ty in [2, 3, 4] { set(ty, &[]); }
+    let mut key_bits = [0u8; 64];
+    unsafe { libc::ioctl(fd, 0x80404521 /* EVIOCGBIT(EV_KEY) */, key_bits.as_mut_ptr()) };
+    if key_bits[30 / 8] & (1 << (30 % 8)) == 0 { // no KEY_A: a mouse
+        set(1, &[0, 0, 0, 0, if watch_mouse { 0b1111 << (273 % 64) } else { 0 }]); // BTN_RIGHT..BTN_EXTRA
+    }
+}
+
+/// Opens the keyboards and mice not open yet. Devices are known by /dev node (number + inode, so a
+/// replugged one is new) and non-keyboards are remembered, so a rescan opens and closes nothing:
+/// every evdev close waits for an RCU grace period, and keys tapped meanwhile were lost.
+#[cfg(target_os = "linux")]
+fn find_keyboard_devices(fds: &mut Vec<i32>, not_keyboards: &mut Vec<(u64, u64)>, watch_mouse: bool) {
+    use std::os::unix::fs::MetadataExt;
+    let open: Vec<_> = fds.iter().filter_map(|fd| std::fs::metadata(format!("/proc/self/fd/{fd}")).ok()).map(|m| (m.rdev(), m.ino())).collect();
+    let known = std::mem::take(not_keyboards);
+    if let Ok(entries) = std::fs::read_dir("/dev/input") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("event") {
+                    let Ok(meta) = std::fs::metadata(&path) else { continue };
+                    let id = (meta.rdev(), meta.ino());
+                    if known.contains(&id) { not_keyboards.push(id); continue; }
+                    if open.contains(&id) { continue; }
+                    if let Ok(c_path) = std::ffi::CString::new(path.to_str().unwrap_or("")) {
+                        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+                        if fd >= 0 {
+                            let mut key_bits = [0u8; 64];
+                            const EVIOCGBIT_KEY_64: u64 = 0x80404521;
+                            let res = unsafe { libc::ioctl(fd, EVIOCGBIT_KEY_64 as _, key_bits.as_mut_ptr()) };
+                            const KEY_A: usize = 30;
+                            const BTN_RIGHT: usize = 273;
+                            let has = |code: usize| (key_bits[code / 8] & (1 << (code % 8))) != 0;
+                            let is_kbd = res >= 0 && (has(KEY_A) || has(BTN_RIGHT));
+                            if is_kbd {
+                                mask_events(fd, watch_mouse);
+                                fds.push(fd);
+                            } else {
+                                if res >= 0 { not_keyboards.push(id); }
+                                unsafe { libc::close(fd); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn vk_to_evdev_code(vk: i32) -> Option<u16> {
+    match vk {
+        0x41 => Some(30), 0x42 => Some(48), 0x43 => Some(46), 0x44 => Some(32),
+        0x45 => Some(18), 0x46 => Some(33), 0x47 => Some(34), 0x48 => Some(35),
+        0x49 => Some(23), 0x4A => Some(36), 0x4B => Some(37), 0x4C => Some(38),
+        0x4D => Some(50), 0x4E => Some(49), 0x4F => Some(24), 0x50 => Some(25),
+        0x51 => Some(16), 0x52 => Some(19), 0x53 => Some(31), 0x54 => Some(20),
+        0x55 => Some(22), 0x56 => Some(47), 0x57 => Some(17), 0x58 => Some(45),
+        0x59 => Some(21), 0x5A => Some(44),
+        0x30 => Some(11), 0x31 => Some(2),  0x32 => Some(3),  0x33 => Some(4),
+        0x34 => Some(5),  0x35 => Some(6),  0x36 => Some(7),  0x37 => Some(8),
+        0x38 => Some(9),  0x39 => Some(10),
+        0x70 => Some(59), 0x71 => Some(60), 0x72 => Some(61), 0x73 => Some(62),
+        0x74 => Some(63), 0x75 => Some(64), 0x76 => Some(65), 0x77 => Some(66),
+        0x78 => Some(67), 0x79 => Some(68), 0x7A => Some(87), 0x7B => Some(88),
+        0x60 => Some(82), 0x61 => Some(79), 0x62 => Some(80), 0x63 => Some(81),
+        0x64 => Some(75), 0x65 => Some(76), 0x66 => Some(77), 0x67 => Some(71),
+        0x68 => Some(72), 0x69 => Some(73), 0x6A => Some(55), 0x6B => Some(78),
+        0x6D => Some(74), 0x6F => Some(98),
+        0x20 => Some(57), 0x09 => Some(15), 0x1B => Some(1),  0x2D => Some(110),
+        0x2E => Some(111), 0x24 => Some(102), 0x23 => Some(107), 0x21 => Some(104),
+        0x22 => Some(109), 0x26 => Some(103), 0x28 => Some(108), 0x25 => Some(105),
+        0x27 => Some(106), 0x14 => Some(58),  0x13 => Some(119), 0x91 => Some(70),
+        0xC0 => Some(41), 0xBD => Some(12), 0xBB => Some(13), 0xDB => Some(26),
+        0xDD => Some(27), 0xBA => Some(39), 0xDE => Some(40), 0xBC => Some(51),
+        0xBE => Some(52), 0xBF => Some(53), 0xDC => Some(43),
+        0x02 => Some(273), 0x04 => Some(274), 0x05 => Some(275), 0x06 => Some(276),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn evdev_code_to_vk(code: u16) -> Option<i32> {
+    match code {
+        30 => Some(0x41), 48 => Some(0x42), 46 => Some(0x43), 32 => Some(0x44),
+        18 => Some(0x45), 33 => Some(0x46), 34 => Some(0x47), 35 => Some(0x48),
+        23 => Some(0x49), 36 => Some(0x4A), 37 => Some(0x4B), 38 => Some(0x4C),
+        50 => Some(0x4D), 49 => Some(0x4E), 24 => Some(0x4F), 25 => Some(0x50),
+        16 => Some(0x51), 19 => Some(0x52), 31 => Some(0x53), 20 => Some(0x54),
+        22 => Some(0x55), 47 => Some(0x56), 17 => Some(0x57), 45 => Some(0x58),
+        21 => Some(0x59), 44 => Some(0x5A),
+        11 => Some(0x30), 2 => Some(0x31),  3 => Some(0x32),  4 => Some(0x33),
+        5 => Some(0x34),  6 => Some(0x35),  7 => Some(0x36),  8 => Some(0x37),
+        9 => Some(0x38),  10 => Some(0x39),
+        59 => Some(0x70), 60 => Some(0x71), 61 => Some(0x72), 62 => Some(0x73),
+        63 => Some(0x74), 64 => Some(0x75), 65 => Some(0x76), 66 => Some(0x77),
+        67 => Some(0x78), 68 => Some(0x79), 87 => Some(0x7A), 88 => Some(0x7B),
+        82 => Some(0x60), 79 => Some(0x61), 80 => Some(0x62), 81 => Some(0x63),
+        75 => Some(0x64), 76 => Some(0x65), 77 => Some(0x66), 71 => Some(0x67),
+        72 => Some(0x68), 73 => Some(0x69), 55 => Some(0x6A), 78 => Some(0x6B),
+        74 => Some(0x6D), 98 => Some(0x6F),
+        57 => Some(0x20), 15 => Some(0x09), 1 => Some(0x1B),  110 => Some(0x2D),
+        111 => Some(0x2E), 102 => Some(0x24), 107 => Some(0x23), 104 => Some(0x21),
+        109 => Some(0x22), 103 => Some(0x26), 108 => Some(0x28), 105 => Some(0x25),
+        106 => Some(0x27), 58 => Some(0x14),  119 => Some(0x13), 70 => Some(0x91),
+        41 => Some(0xC0), 12 => Some(0xBD), 13 => Some(0xBB), 26 => Some(0xDB),
+        27 => Some(0xDD), 39 => Some(0xBA), 40 => Some(0xDE), 51 => Some(0xBC),
+        52 => Some(0xBE), 53 => Some(0xBF), 43 => Some(0xDC),
+        273 => Some(0x02), 274 => Some(0x04), 275 => Some(0x05), 276 => Some(0x06),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+const CANDIDATE_EVDEV_KEYS: &[u16] = &[
+    30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45, 21, 44,
+    11, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+    59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 87, 88,
+    82, 79, 80, 81, 75, 76, 77, 71, 72, 73, 55, 78, 74, 98,
+    57, 15, 1, 110, 111, 102, 107, 104, 109, 103, 108, 105, 106, 58, 119, 70,
+    41, 12, 13, 26, 27, 39, 40, 51, 52, 53, 43,
+    273, 274, 275, 276, // mouse buttons (not the left one)
+];
+
+/// Creates a message-only window that receives raw keyboard input from the whole
+/// system (RIDEV_INPUTSINK), so the calling thread can block in GetMessageW until a
+/// key changes. Returns null on failure.
+#[cfg(target_os = "windows")]
+unsafe fn create_raw_keyboard_sink() -> windows_sys::Win32::Foundation::HWND {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::Input::{RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_INPUTSINK};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, HWND_MESSAGE, WNDCLASSW,
+    };
+
+    let class: Vec<u16> = "kiyoraKeybindSink\0".encode_utf16().collect();
+    let hinstance = GetModuleHandleW(std::ptr::null());
+    let mut wc: WNDCLASSW = std::mem::zeroed();
+    wc.lpfnWndProc = Some(DefWindowProcW);
+    wc.hInstance = hinstance;
+    wc.lpszClassName = class.as_ptr();
+    RegisterClassW(&wc);
+
+    let hwnd = CreateWindowExW(
+        0, class.as_ptr(), class.as_ptr(), 0, 0, 0, 0, 0,
+        HWND_MESSAGE, std::ptr::null_mut(), hinstance, std::ptr::null(),
+    );
+    if hwnd.is_null() {
+        return hwnd;
+    }
+    let device = RAWINPUTDEVICE {
+        usUsagePage: 0x01, // generic desktop
+        usUsage: 0x06,     // keyboard
+        dwFlags: RIDEV_INPUTSINK,
+        hwndTarget: hwnd,
+    };
+    if RegisterRawInputDevices(&device, 1, std::mem::size_of::<RAWINPUTDEVICE>() as u32) == 0 {
+        DestroyWindow(hwnd);
+        return std::ptr::null_mut();
+    }
+    hwnd
+}
+
+/// Reads a WM_INPUT keyboard event as (virtual key, pressed).
+#[cfg(target_os = "windows")]
+unsafe fn read_raw_key(lparam: windows_sys::Win32::Foundation::LPARAM) -> Option<(i32, bool)> {
+    use windows_sys::Win32::UI::Input::{GetRawInputData, RAWINPUT, RAWINPUTHEADER, RID_INPUT, RIM_TYPEKEYBOARD};
+    use windows_sys::Win32::UI::WindowsAndMessaging::RI_KEY_BREAK;
+
+    let mut raw: RAWINPUT = std::mem::zeroed();
+    let mut size = std::mem::size_of::<RAWINPUT>() as u32;
+    let read = GetRawInputData(
+        lparam as _, RID_INPUT, &mut raw as *mut RAWINPUT as *mut _, &mut size,
+        std::mem::size_of::<RAWINPUTHEADER>() as u32,
+    );
+    if read == u32::MAX || raw.header.dwType != RIM_TYPEKEYBOARD {
+        return None;
+    }
+    let kb = raw.data.keyboard;
+    // 0xFF marks the fake keys some keyboards send as part of escape sequences.
+    if kb.VKey == 0 || kb.VKey == 0xFF {
+        return None;
+    }
+    Some((kb.VKey as i32, (kb.Flags as u32 & RI_KEY_BREAK) == 0))
+}
+
+/// Drops WM_INPUT messages already queued for this thread.
+#[cfg(target_os = "windows")]
+unsafe fn discard_pending_raw_input() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, MSG, PM_REMOVE, WM_INPUT};
+    let mut msg: MSG = std::mem::zeroed();
+    while PeekMessageW(&mut msg, std::ptr::null_mut(), WM_INPUT, WM_INPUT, PM_REMOVE) != 0 {
+        DispatchMessageW(&msg);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mouse_buttons_parse_and_only_their_shortcuts_need_watching() {
+        assert_eq!(name_to_vkey("Mouse 4"), Some(0x05));
+        assert_eq!(name_to_vkey("mouse5"), Some(0x06));
+        assert_eq!(name_to_vkey("Mouse 1"), None);
+        assert_eq!(vkey_to_name(0x04), "Mouse 3");
+        let combo = KeyCombo::parse("Ctrl+Mouse 4").unwrap();
+        assert!(combo.ctrl && !combo.shift && !combo.alt);
+        assert_eq!(combo.vkey, 0x05);
+
+        let keys = KeybindsConfig::default();
+        assert!(!uses_mouse_button(&keys));
+        let mouse = KeybindsConfig { mute_shortcut: "Mouse 5".into(), ..KeybindsConfig::default() };
+        assert!(uses_mouse_button(&mouse));
+    }
+}

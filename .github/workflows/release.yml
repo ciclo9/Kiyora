@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build kiyora.exe (Windows x86_64)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust stable (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build kiyora.exe (release)
+        run: cargo build --release --locked
+        env:
+          CARGO_TERM_COLOR: always
+
+      - name: Compute SHA256 checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash "target\release\kiyora.exe" -Algorithm SHA256).Hash.ToLower()
+          "$hash  kiyora.exe" | Out-File -Encoding utf8 "target\release\kiyora.exe.sha256"
+          Write-Host "SHA256: $hash"
+
+      - name: Upload kiyora.exe to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Kiyora ${{ github.ref_name }}
+          body: |
+            ## Kiyora ${{ github.ref_name }}
+
+            Ultra-lightweight native Discord client for Windows 10/11.
+
+            ### Download
+            - **`kiyora.exe`** — Single portable executable, no installer required
+            - **`kiyora.exe.sha256`** — SHA-256 checksum for verification
+
+            ### Verify integrity (PowerShell)
+            ```powershell
+            (Get-FileHash kiyora.exe -Algorithm SHA256).Hash.ToLower()
+            # Compare with contents of kiyora.exe.sha256
+            ```
+
+            ### Requirements
+            - Windows 10 or Windows 11 (x86_64)
+            - Visual C++ Redistributable 2022 (usually pre-installed)
+
+            ---
+            [Source code](https://github.com/ciclo9/kiyora) · [Report an issue](https://github.com/ciclo9/kiyora/issues)
+          files: |
+            target/release/kiyora.exe
+            target/release/kiyora.exe.sha256
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') || contains(github.ref_name, '-rc') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
