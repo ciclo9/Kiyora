@@ -158,7 +158,7 @@ pub fn list_capturable_windows() -> Vec<CapturableWindowItem> {
                 } else if exe_name.contains("terminal") || exe_name.contains("powershell") || exe_name.contains("cmd") || lower.contains("terminal") {
                     "Terminal".to_string()
                 } else if exe_name.contains("notepad") || lower.contains("bloco de notas") {
-                    "Bloco de Notas".to_string()
+                    "Notepad".to_string()
                 } else if !exe_name.is_empty() {
                     let clean = exe_name.trim_end_matches(".exe");
                     let mut chars = clean.chars();

@@ -74,13 +74,13 @@ The compiled binary will be at `target/release/kiyora.exe`.
 
 ## Configuration
 
-Kiyora stores all configuration in `%APPDATA%\Kiyora\` and `%LOCALAPPDATA%\Kiyora\`.
+Kiyora stores all configuration and application data safely within your user profile:
 
-| File | Purpose |
+| Path | Purpose |
 |------|---------|
-| `.kiyora_language.json` | UI language preference |
-| `.kiyora_updater_config.json` | Update ignore list |
-| `kiyora_app.log` | Application log |
+| `%APPDATA%\Kiyora\` | Local configuration & DPAPI-encrypted user tokens |
+| `%LOCALAPPDATA%\Kiyora\logs\kiyora.log` | Application debug and runtime logs |
+| `%LOCALAPPDATA%\Kiyora\logs\panic.log` | Crash and panic traces |
 
 ---
 
@@ -135,3 +135,9 @@ Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) first.
 <p align="center">
   <a href="https://github.com/ciclo9/kiyora">github.com/ciclo9/kiyora</a>
 </p>
+
+---
+
+### Acknowledgments
+
+Rebuild of https://github.com/Ak4ai/Litecord

@@ -1,4 +1,4 @@
-﻿#![allow(dead_code)]
+#![allow(dead_code)]
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -87,7 +87,7 @@ pub async fn connect_voice_gateway(
                 let cid_num: u64 = channel_id_str.parse().unwrap_or(0);
                 let dave_session: Arc<std::sync::Mutex<Option<DaveSession>>> = Arc::new(std::sync::Mutex::new(
                     DaveSession::new(NonZeroU16::new(1).unwrap(), uid_num, cid_num, None)
-                        .map_err(|e| { warn!("Falha ao criar DaveSession: {:?}", e); })
+                        .map_err(|e| { warn!("Failed to create DaveSession: {:?}", e); })
                         .ok()
                 ));
                 let saved_external_sender: Arc<std::sync::Mutex<Option<Vec<u8>>>> = Arc::new(std::sync::Mutex::new(None));
@@ -102,7 +102,7 @@ pub async fn connect_voice_gateway(
                         Ok(Message::Text(text)) => {
                             if let Ok(val) = serde_json::from_str::<Value>(&text) {
                                 let op = val["op"].as_u64().unwrap_or(99);
-                                info!("Payload recebido da Voice Gateway: op={}", op);
+                                info!("Payload received from Voice Gateway: op={}", op);
 
                             match op {
                                 8 => {
@@ -111,7 +111,7 @@ pub async fn connect_voice_gateway(
                                         .as_f64()
                                         .unwrap_or(20000.0);
                                     let heartbeat_interval = (raw_interval * 0.75).max(1000.0) as u64;
-                                    info!("Voice Gateway HELLO recebido! Intervalo de Heartbeat configurado: {} ms (servidor={}, fator=0.75)", heartbeat_interval, raw_interval);
+                                    info!("Voice Gateway HELLO received! Heartbeat interval configured: {} ms (server={}, factor=0.75)", heartbeat_interval, raw_interval);
 
                                     // 1. Send Opcode 0 Voice Identify (with max_dave_protocol_version: 1 for E2EE DAVE support)
                                     let voice_identify = serde_json::json!({
@@ -127,11 +127,11 @@ pub async fn connect_voice_gateway(
                                         }
                                     });
 
-                                    info!("Enviando OP 0 Voice Identify para a Voice Gateway: {}", voice_identify);
+                                    info!("Sending OP 0 Voice Identify to Voice Gateway: {}", voice_identify);
                                     {
                                         let mut w = write_arc.lock().await;
                                         if let Err(e) = w.send(Message::Text(voice_identify.to_string().into())).await {
-                                            error!("Erro ao enviar Opcode 0 Voice Identify: {:?}", e);
+                                            error!("Error sending Opcode 0 Voice Identify: {:?}", e);
                                             break;
                                         }
                                     }
@@ -146,7 +146,7 @@ pub async fn connect_voice_gateway(
                                             let hb = serde_json::json!({ "op": 3, "d": t_now });
                                             let mut w = write_hb.lock().await;
                                             if let Err(e) = w.send(Message::Text(hb.to_string().into())).await {
-                                                warn!("⚠️ Falha ao enviar Heartbeat de voz (op=3): {:?}", e);
+                                                warn!("⚠️ Failed to send voice heartbeat (op=3): {:?}", e);
                                                 break;
                                             }
                                         }
@@ -173,7 +173,7 @@ pub async fn connect_voice_gateway(
                                         "aead_aes256_gcm_rtpsize".to_string()
                                     };
 
-                                    info!("🎉 VOICE GATEWAY PRONTA (Opcode 2 READY)! SSRC={}, IP={}:{}, Encryption Mode={}", ssrc, voice_ip, voice_port, selected_mode);
+                                    info!("🎉 VOICE GATEWAY READY (Opcode 2 READY)! SSRC={}, IP={}:{}, Encryption Mode={}", ssrc, voice_ip, voice_port, selected_mode);
 
                                     // Synthesize Join Voice Chime (523.25Hz C5 -> 659.25Hz E5) to test local audio playback
                                     let mut chime_samples = Vec::new();
@@ -196,7 +196,7 @@ pub async fn connect_voice_gateway(
                                             q.push_back((s, s));
                                         }
                                     }
-                                    info!("🎵 Efeito sonoro de entrada no canal de voz injetado na fila dos alto-falantes!");
+                                    info!("🎵 Join channel sound effect queued to speakers!");
 
                                     // UDP IP Discovery & Opcode 1 Select Protocol Handshake
                                     if !voice_ip.is_empty() && voice_port > 0 {
@@ -211,10 +211,10 @@ pub async fn connect_voice_gateway(
                                         tokio::spawn(async move {
                                             let socket = match UdpSocket::bind("0.0.0.0:0").await {
                                                 Ok(s) => Arc::new(s),
-                                                Err(e) => { warn!("Falha ao criar socket UDP de voz: {:?}", e); return; }
+                                                Err(e) => { warn!("Failed to create voice UDP socket: {:?}", e); return; }
                                             };
                                                 let target_addr = format!("{}:{}", voice_ip, voice_port);
-                                                info!("Socket UDP de Voz conectado a {}", target_addr);
+                                                info!("Voice UDP socket connected to {}", target_addr);
 
                                                 // 1. Send 74-byte UDP IP Discovery Packet (RFC / Discord spec: 2 bytes type, 2 bytes len, 4 bytes ssrc, 64 bytes addr, 2 bytes port)
                                                 let mut discovery = [0u8; 74];
@@ -290,7 +290,7 @@ pub async fn connect_voice_gateway(
 
                                                 // 3. Initialize Pure Rust OpusEncoder (48000Hz, Stereo 2 channels, Application::Voip)
                                                 let mut opus_encoder = OpusEncoder::new(48000, 2, Application::Voip)
-                                                    .expect("Falha ao inicializar o OpusEncoder nativo em Rust");
+                                                    .expect("Failed to initialize native Rust OpusEncoder");
 
                                                 // 4. Spawn incoming UDP voice receive loop
                                                 let socket_rx = Arc::clone(&socket);
@@ -554,7 +554,7 @@ pub async fn connect_voice_gateway(
 
                                                                             pkt_channels = if (raw_opus[0] & 0x04) != 0 { 2 } else { 1 };
                                                                             let dec = opus_decoders.entry((ssrc_recv, pkt_channels)).or_insert_with(|| {
-                                                                                OpusDecoder::new(48000, pkt_channels).expect("Falha ao inicializar OpusDecoder 48kHz")
+                                                                                OpusDecoder::new(48000, pkt_channels).expect("Failed to initialize 48kHz OpusDecoder")
                                                                             });
 
                                                                             let now = std::time::Instant::now();
@@ -679,7 +679,7 @@ pub async fn connect_voice_gateway(
                                                                 // Retry with backoff (each try enumerates every endpoint)
                                                                 // and say it once, not every half second.
                                                                 if no_device_wait.is_none() {
-                                                                    warn!("Nenhum dispositivo de saída de áudio encontrado! Aguardando...");
+                                                                    warn!("No audio output device found! Waiting...");
                                                                 }
                                                                 let wait = next_no_device_wait(no_device_wait);
                                                                 no_device_wait = Some(wait);
@@ -688,20 +688,20 @@ pub async fn connect_voice_gateway(
                                                             }
                                                         };
                                                         if no_device_wait.take().is_some() {
-                                                            info!("🔊 Dispositivo de saída de áudio disponível novamente.");
+                                                            info!("🔊 Audio output device available again.");
                                                         }
 
                                                         let config = match device.default_output_config() {
                                                             Ok(c) => c,
                                                             Err(e) => {
-                                                                warn!("Falha ao obter config de saída: {:?}", e);
+                                                                warn!("Failed to get output config: {:?}", e);
                                                                 std::thread::sleep(std::time::Duration::from_millis(500));
                                                                 continue;
                                                             }
                                                         };
                                                         let out_sample_rate = config.sample_rate().0;
                                                         let out_channels = config.channels() as usize;
-                                                        info!("Saída de Áudio (Speaker): {}Hz, {} canal(is), formato={:?} (Dispositivo: {})",
+                                                        info!("Audio Output (Speaker): {}Hz, {} channel(s), format={:?} (Device: {})",
                                                             out_sample_rate, out_channels, config.sample_format(), target_dev_name);
 
                                                     let sq = Arc::clone(&speaker_queues_out);
@@ -1083,11 +1083,11 @@ pub async fn connect_voice_gateway(
                                                     match stream_res {
                                                         Ok(stream) => {
                                                             if let Err(e) = stream.play() {
-                                                                warn!("Falha ao iniciar stream de saída: {:?}", e);
+                                                                warn!("Failed to start output stream: {:?}", e);
                                                                 std::thread::sleep(std::time::Duration::from_millis(500));
                                                                 continue;
                                                             }
-                                                            info!("🔊 Stream de Saída de Áudio (Speaker) ATIVO! Reproduzindo vozes dos outros usuários...");
+                                                            info!("🔊 Audio Output Stream (Speaker) ACTIVE! Playing other users' voices...");
                                                             #[cfg(feature = "automation")]
                                                             crate::utils::test_hooks::voice_output_started();
                                                             // Keep stream alive until voice session ends OR user selects another output device!
@@ -1104,8 +1104,8 @@ pub async fn connect_voice_gateway(
                                                                 }
                                                                 let broken = output_broken.load(Ordering::Relaxed);
                                                                 if broken || quiet_since.elapsed() >= OUTPUT_STALL {
-                                                                    warn!("🔊 Saída de áudio {}: recriando o stream.",
-                                                                        if broken { "com erro" } else { "parada" });
+                                                                    warn!("🔊 Audio output {}: recreating stream.",
+                                                                        if broken { "error state" } else { "stalled" });
                                                                     let wait = next_no_device_wait(output_retry_wait);
                                                                     output_retry_wait = Some(wait);
                                                                     drop(stream);
@@ -1119,28 +1119,28 @@ pub async fn connect_voice_gateway(
                                                                 // Test: the device stops the stream (as a failing driver would).
                                                                 #[cfg(feature = "automation")]
                                                                 if crate::utils::test_hooks::BREAK_VOICE_OUTPUT.swap(false, Ordering::SeqCst) {
-                                                                    warn!("🧪 [TEST] Stream de saída interrompido (falha simulada do dispositivo).");
+                                                                    warn!("🧪 [TEST] Output stream stopped (simulated device failure).");
                                                                     let _ = stream.pause();
                                                                 }
                                                                 if CURRENT_VOICE_SESSION_ID.load(Ordering::SeqCst) != out_session_id {
-                                                                    info!("Stream de saída encerrado (sessão expirada).");
+                                                                    info!("Output stream terminated (session expired).");
                                                                     return;
                                                                 }
                                                                 let new_target = get_selected_output_device_store().lock().unwrap().clone();
                                                                 if new_target != current_target_dev {
-                                                                    info!("🔄 Dispositivo de saída alterado de '{}' para '{}' durante a chamada! Reconfigurando alto-falante...", current_target_dev, new_target);
+                                                                    info!("🔄 Output device changed from '{}' to '{}' during call! Reconfiguring speaker...", current_target_dev, new_target);
                                                                     current_target_dev = new_target;
-                                                                    break; // Sai do loop interno, dropa o stream atual e o while externo reconstrói no novo dispositivo!
+                                                                    break;
                                                                 }
                                                             }
                                                         }
                                                         Err(e) => {
-                                                            warn!("Falha ao criar stream de saída: {:?}", e);
+                                                            warn!("Failed to create output stream: {:?}", e);
                                                             std::thread::sleep(std::time::Duration::from_millis(500));
                                                         }
                                                     }
                                                 }
-                                                info!("Loop principal de áudio de saída encerrado.");
+                                                info!("Audio output main loop terminated.");
                                             });
 
                                                 tokio::spawn(async move {
@@ -1153,14 +1153,14 @@ pub async fn connect_voice_gateway(
                                                 let mut speaking_loop_counter: u32 = 0;
 
                                                 // Wait for the secret key (received in op=4) before starting audio
-                                                info!("Aguardando chave secreta (op=4) antes de iniciar o áudio...");
+                                                info!("Waiting for secret key (op=4) before starting audio...");
                                                 loop {
                                                     if CURRENT_VOICE_SESSION_ID.load(Ordering::SeqCst) != my_session_id { break; }
                                                     let has_key = secret_key_udp.lock().unwrap().is_some();
                                                     if has_key { break; }
                                                     sleep(Duration::from_millis(50)).await;
                                                 }
-                                                info!("Chave secreta recebida! Iniciando transmissão de áudio...");
+                                                info!("Secret key received! Starting audio transmission...");
 
                                                 // Flush any stale mic buffer accumulated before voice handshake completed
                                                 if let Ok(mut q) = pcm_queue.lock() {
@@ -1335,7 +1335,7 @@ pub async fn connect_voice_gateway(
                                                                     }
                                                                     Err(e) => {
                                                                         if speaking_loop_counter % 250 == 0 {
-                                                                            warn!("DAVE: Falha em encrypt_opus: {:?}", e);
+                                                                            warn!("DAVE: Failed in encrypt_opus: {:?}", e);
                                                                         }
                                                                         None
                                                                     }
@@ -1397,12 +1397,12 @@ pub async fn connect_voice_gateway(
                                 4 => {
                                     // Voice Opcode 4: Session Description (Handshake Complete & Secret Key received!)
                                     let ssrc = *active_ssrc.lock().unwrap();
-                                    info!("ðŸŽ‰ VOICE GATEWAY OPCODE 4 SESSION DESCRIPTION RECEBIDO! SessÃ£o de Voz Ativada com Sucesso!");
+                                    info!("🎉 VOICE GATEWAY OPCODE 4 SESSION DESCRIPTION RECEIVED! Voice Session Activated Successfully!");
 
                                     if let Some(key_arr) = val["d"]["secret_key"].as_array() {
                                         let key_bytes: Vec<u8> = key_arr.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect();
                                         if key_bytes.len() == 32 {
-                                            info!("Chave de criptografia AES-256 de 32 bytes configurada com SUCESSO para os pacotes de áudio!");
+                                            info!("32-byte AES-256 encryption key configured SUCCESSFULLY for audio packets!");
                                             let mut fixed = [0u8; 32];
                                             fixed.copy_from_slice(&key_bytes);
                                             *get_voice_secret_key_store().lock().unwrap() = Some(fixed);
@@ -1479,7 +1479,7 @@ pub async fn connect_voice_gateway(
                                     if u_id > 0 {
                                         let ssrc = (u_id & 0xFFFFFFFF) as u32;
                                         register_voice_participant(ssrc, u_id);
-                                        info!("👥 Voice Gateway OP 18 DAVE Transition: Registrado participante no canal de voz! User ID {}", u_id);
+                                        info!("👥 Voice Gateway OP 18 DAVE Transition: Registered participant in voice channel! User ID {}", u_id);
                                     }
                                     info!("DAVE Prepare Transition (op=18): transition_id={}, protocol_version={}, payload={}",
                                         transition_id, protocol_version, val["d"]);
@@ -1490,7 +1490,7 @@ pub async fn connect_voice_gateway(
                                     });
                                     let mut w = write_arc.lock().await;
                                     let _ = w.send(Message::Text(ready.to_string().into())).await;
-                                    info!("DAVE: Ready For Transition (op=23) enviado para transition_id={}", transition_id);
+                                    info!("DAVE: Ready For Transition (op=23) sent for transition_id={}", transition_id);
                                 }
                                 19 => {
                                     // DAVE Opcode 19: DAVE_EXECUTE_TRANSITION (Server -> Client)
@@ -1503,7 +1503,7 @@ pub async fn connect_voice_gateway(
                                     });
                                     let mut w = write_arc.lock().await;
                                     let _ = w.send(Message::Text(speaking_pkt.to_string().into())).await;
-                                    info!("DAVE OP 19: Enviado OP 5 Speaking para sincronizar SSRC {} na transição de época!", ssrc);
+                                    info!("DAVE OP 19: Sent OP 5 Speaking to sync SSRC {} on epoch transition!", ssrc);
                                 }
                                 20 => {
                                     // DAVE Opcode 20: DAVE_TRANSITION_READY
@@ -1593,13 +1593,13 @@ pub async fn connect_voice_gateway(
                                     if let Some(ref mut s) = *sess {
                                         match s.set_external_sender(payload) {
                                             Ok(()) => {
-                                                info!("DAVE: External sender configurado com sucesso!");
+                                                info!("DAVE: External sender configured successfully!");
                                                 match s.create_key_package() {
-                                                    Ok(kp) => { info!("DAVE: KeyPackage gerado ({} bytes)", kp.len()); Some(kp) }
-                                                    Err(e) => { warn!("DAVE: Falha ao gerar KeyPackage: {:?}", e); None }
+                                                    Ok(kp) => { info!("DAVE: KeyPackage generated ({} bytes)", kp.len()); Some(kp) }
+                                                    Err(e) => { warn!("DAVE: Failed to generate KeyPackage: {:?}", e); None }
                                                 }
                                             }
-                                            Err(e) => { warn!("DAVE: Falha ao configurar external sender: {:?}", e); None }
+                                            Err(e) => { warn!("DAVE: Failed to configure external sender: {:?}", e); None }
                                         }
                                     } else { None }
                                 };
@@ -1609,7 +1609,7 @@ pub async fn connect_voice_gateway(
                                     pkt.extend_from_slice(&kp);
                                     let mut w = write_arc.lock().await;
                                     let _ = w.send(Message::Binary(pkt.into())).await;
-                                    info!("DAVE: KeyPackage (op=26) enviado Ã  Voice Gateway!");
+                                    info!("DAVE: KeyPackage (op=26) sent to Voice Gateway!");
                                 }
                             }
                             27 => {
@@ -1619,13 +1619,13 @@ pub async fn connect_voice_gateway(
                                     _ => ProposalsOperationType::REVOKE,
                                 };
                                 let proposals_data = if data.len() > 2 { &data[2..] } else { &[][..] };
-                                info!("DAVE: Proposals (op=27) recebido, type={:?}", op_type);
+                                info!("DAVE: Proposals (op=27) received, type={:?}", op_type);
                                 let commit_bytes = {
                                     let mut sess = dave_session.lock().unwrap();
                                     if let Some(ref mut s) = *sess {
                                         match s.process_proposals(op_type, proposals_data, None) {
                                             Ok(Some(cw)) => {
-                                                info!("DAVE: CommitWelcome gerado ({} commit bytes, welcome={})",
+                                                info!("DAVE: CommitWelcome generated ({} commit bytes, welcome={})",
                                                     cw.commit.len(), cw.welcome.as_ref().map(|w| w.len()).unwrap_or(0));
                                                 let mut out = cw.commit.clone();
                                                 if let Some(w) = cw.welcome {
@@ -1636,8 +1636,8 @@ pub async fn connect_voice_gateway(
                                                 }
                                                 Some(out)
                                             }
-                                            Ok(None) => { info!("DAVE: process_proposals OK sem commit"); None }
-                                            Err(e) => { warn!("DAVE: Falha ao processar proposals: {:?}", e); None }
+                                            Ok(None) => { info!("DAVE: process_proposals OK without commit"); None }
+                                            Err(e) => { warn!("DAVE: Failed to process proposals: {:?}", e); None }
                                         }
                                     } else { None }
                                 };
@@ -1647,7 +1647,7 @@ pub async fn connect_voice_gateway(
                                     pkt.extend_from_slice(&commit_data);
                                     let mut w = write_arc.lock().await;
                                     let _ = w.send(Message::Binary(pkt.into())).await;
-                                    info!("DAVE: CommitWelcome (op=28) enviado Ã  Voice Gateway!");
+                                    info!("DAVE: CommitWelcome (op=28) sent Ã  Voice Gateway!");
                                 }
                             }
                             29 => {
@@ -1663,11 +1663,11 @@ pub async fn connect_voice_gateway(
                                     if let Some(ref mut s) = *sess {
                                         match s.process_commit(commit_payload) {
                                             Ok(()) => {
-                                                info!("DAVE: Commit processado com sucesso! is_ready={}", s.is_ready());
+                                                info!("DAVE: Commit processed successfully! is_ready={}", s.is_ready());
                                                 true
                                             }
                                             Err(e) => {
-                                                warn!("DAVE: Falha ao processar commit: {:?}", e);
+                                                warn!("DAVE: Failed to process commit: {:?}", e);
                                                 false
                                             }
                                         }
@@ -1686,7 +1686,7 @@ pub async fn connect_voice_gateway(
                                     });
                                     let mut w = write_arc.lock().await;
                                     let _ = w.send(Message::Text(ready.to_string().into())).await;
-                                    info!("DAVE: Ready For Transition (op=23) enviado para AnnounceCommit transition_id={}", transition_id);
+                                    info!("DAVE: Ready For Transition (op=23) sent for AnnounceCommit transition_id={}", transition_id);
                                 }
                             }
                             30 => {
@@ -1695,18 +1695,18 @@ pub async fn connect_voice_gateway(
                                     u16::from_be_bytes([data[1], data[2]]) as u64
                                 } else { 0 };
                                 let welcome_payload = if data.len() > 3 { &data[3..] } else { &[][..] };
-                                info!("DAVE: Welcome (op=30) recebido! transition_id={}, payload len={}", transition_id, welcome_payload.len());
+                                info!("DAVE: Welcome (op=30) received! transition_id={}, payload len={}", transition_id, welcome_payload.len());
                                 dave_flow.prepare(transition_id);
                                 let is_active = {
                                     let mut sess = dave_session.lock().unwrap();
                                     if let Some(ref mut s) = *sess {
                                         match s.process_welcome(welcome_payload) {
                                             Ok(()) => {
-                                                info!("ðŸŽ‰ DAVE: Welcome processado com SUCESSO! SessÃ£o ATIVA! is_ready={}", s.is_ready());
+                                                info!("🎉 DAVE: Welcome processed SUCCESSFULLY! Session ACTIVE! is_ready={}", s.is_ready());
                                                 true
                                             }
                                             Err(e) => {
-                                                warn!("DAVE: Falha ao processar welcome: {:?}", e);
+                                                warn!("DAVE: Failed to process welcome: {:?}", e);
                                                 false
                                             }
                                         }
@@ -1725,26 +1725,26 @@ pub async fn connect_voice_gateway(
                                     });
                                     let mut w = write_arc.lock().await;
                                     let _ = w.send(Message::Text(ready.to_string().into())).await;
-                                    info!("DAVE: Ready For Transition (op=23) enviado para Welcome transition_id={}", transition_id);
+                                    info!("DAVE: Ready For Transition (op=23) sent for Welcome transition_id={}", transition_id);
                                 }
                             }
                             _ => {
-                                info!("DAVE: Opcode binÃ¡rio unknown: {}", dave_op);
+                                info!("DAVE: Unknown binary opcode: {}", dave_op);
                             }
                         }
                      }
                     Ok(Message::Close(frame)) => {
-                        info!("Voice Gateway conexão fechada pelo servidor: {:?}", frame);
+                        info!("Voice Gateway connection closed by server: {:?}", frame);
                         if let Some(code) = frame.as_ref().map(|f| u16::from(f.code)).filter(|c| VOICE_CLOSE_FINAL.contains(c)) {
                             // Retrying the same session cannot work; a move to another voice
                             // server arrives as a new session from the main gateway.
-                            warn!("🔇 [VOICE GATEWAY] Fechamento definitivo ({}): a sessão {} não será reconectada.", code, my_session_id);
+                            warn!("🔇 [VOICE GATEWAY] Permanent close ({}): session {} will not reconnect.", code, my_session_id);
                             final_close = true;
                         }
                         break;
                     }
                     Err(e) => {
-                        warn!("Aviso de leitura na Voice Gateway: {:?}", e);
+                        warn!("Voice Gateway read warning: {:?}", e);
                         break;
                     }
                     _ => {}
@@ -1753,7 +1753,7 @@ pub async fn connect_voice_gateway(
 
             set_is_connected_to_voice(false);
             if CURRENT_VOICE_SESSION_ID.load(Ordering::SeqCst) != my_session_id {
-                info!("Sessão de voz {} finalizada pelo usuário.", my_session_id);
+                info!("Voice session {} terminated by user.", my_session_id);
                 clear_voice_participants();
                 break;
             }
@@ -1761,13 +1761,13 @@ pub async fn connect_voice_gateway(
                 clear_voice_participants();
                 break;
             }
-            warn!("⚠️ [VOICE GATEWAY] Conexão com Voice Gateway temporariamente perdida. Reconectando em 1.5s...");
+            warn!("⚠️ [VOICE GATEWAY] Connection to Voice Gateway temporarily lost. Reconnecting in 1.5s...");
         }
         Err(e) => {
             if CURRENT_VOICE_SESSION_ID.load(Ordering::SeqCst) != my_session_id {
                 break;
             }
-            warn!("Falha ao conectar na Voice Gateway: {:?}. Tentando reconectar em 800ms...", e);
+            warn!("Failed to connect to Voice Gateway: {:?}. Retrying in 800ms...", e);
             tokio::time::sleep(Duration::from_millis(800)).await;
         }
     }

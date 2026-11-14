@@ -76,7 +76,7 @@ pub fn ensure_stream_audio_playback_started() {
                 let host = cpal::default_host();
                 let queue = get_stream_audio_queue();
 
-                info!("🔊 [STREAM PLAYBACK] Inicializando subsistema de saída de áudio para stream...");
+                info!("🔊 [STREAM PLAYBACK] Initializing audio output subsystem para stream...");
 
                 loop {
                     // The output device is only opened on demand: while idle (no stream audio
@@ -127,7 +127,7 @@ pub fn ensure_stream_audio_playback_started() {
                     }
 
                     if devices_to_try.is_empty() {
-                        warn!("⚠️ [STREAM PLAYBACK] Nenhum dispositivo de saída encontrado!");
+                        warn!("⚠️ [STREAM PLAYBACK] No output device encontrado!");
                         std::thread::sleep(Duration::from_secs(3));
                         continue;
                     }
@@ -245,7 +245,7 @@ pub fn ensure_stream_audio_playback_started() {
                             }
                         }
                         drop(stream);
-                        info!("🔊 [STREAM PLAYBACK] Saída de áudio da stream liberada (ociosa).");
+                        info!("🔊 [STREAM PLAYBACK] Stream audio output released (ociosa).");
                     } else {
                         warn!("⚠️ [STREAM PLAYBACK] Falha ao iniciar playback em todos os dispositivos. Tentando novamente em 3 segundos...");
                         std::thread::sleep(Duration::from_secs(3));
@@ -369,7 +369,7 @@ impl LinuxLoopbackSinkGuard {
             let _ = std::process::Command::new("pactl")
                 .args(["set-default-sink", "kiyoraDesktopSink"])
                 .status();
-            info!("🛡️ [LOOPBACK TX] Sink virtual isolado 'kiyoraDesktopSink' criado (áudio do kiyora excluído da transmissão de tela)!");
+            info!("🛡️ [LOOPBACK TX] Virtual isolated sink 'kiyoraDesktopSink' criado (áudio do kiyora excluído da transmissão de tela)!");
 
             // Move imediatamente qualquer stream já aberta do kiyora de volta para o hardware físico
             Self::move_kiyora_sink_inputs(&orig);
@@ -544,7 +544,7 @@ pub fn start_audio_loopback_tx(
                 let try_wasapi_isolated = loopback_backend == "auto" || loopback_backend == "wasapi_isolated";
 
                 if try_wasapi_isolated {
-                    info!("🎙️ [LOOPBACK TX] Inicializando captura de áudio nativa isolada (WASAPI Process Loopback)...");
+                    info!("🎙️ [LOOPBACK TX] Initializing native audio capture isolada (WASAPI Process Loopback)...");
                     match crate::wasapi_loopback::start_wasapi_isolated_loopback(
                         Arc::clone(&is_running),
                         Arc::clone(&pcm_buffer_cb),
@@ -682,13 +682,13 @@ pub fn start_audio_loopback_tx(
 
             #[cfg(target_os = "windows")]
             if active_stream.is_none() && wasapi_isolated_handle.is_none() {
-                warn!("⚠️ [LOOPBACK TX] Falha ao ativar stream de áudio em todos os dispositivos disponíveis!");
+                warn!("⚠️ [LOOPBACK TX] Failed to activate audio stream em todos os dispositivos disponíveis!");
                 return;
             }
 
             #[cfg(target_os = "linux")]
             if gst_child.is_none() {
-                warn!("⚠️ [LOOPBACK TX] Falha ao ativar captura de áudio do sistema via GStreamer pulsesrc!");
+                warn!("⚠️ [LOOPBACK TX] Failed to activate system audio capture via GStreamer pulsesrc!");
                 return;
             }
 
@@ -794,7 +794,7 @@ pub fn start_audio_loopback_tx(
                 let _ = child.kill();
                 let _ = child.wait();
             }
-            info!("🔊 [LOOPBACK TX] Captura de áudio da transmissão finalizada.");
+            info!("🔊 [LOOPBACK TX] Stream audio capture finished.");
         })
         .expect("Falha ao iniciar thread de captura de áudio da transmissão");
 }

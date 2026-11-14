@@ -1,4 +1,4 @@
-﻿#![allow(dead_code)]
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
@@ -166,17 +166,17 @@ pub fn process_signaling_json(
                 prev.unwrap_or(false)
             };
 
-            info!("📡 [SIGNALING PRESENÇA] De UID={} (inst={}) | streaming={} (was={}) | WAN={:?} | LAN={:?}", pkt_uid, pkt_inst, is_streaming, was_streaming, val["wan_ip"], val["lan_ips"]);
+            info!("📡 [SIGNALING PRESENCE] From UID={} (inst={}) | streaming={} (was={}) | WAN={:?} | LAN={:?}", pkt_uid, pkt_inst, is_streaming, was_streaming, val["wan_ip"], val["lan_ips"]);
 
             if is_streaming {
                 mark_stream_started(pkt_uid);
             }
 
-            // Se o peer parou de transmitir tela, fecha imediatamente (<50ms) sem esperar timeout de pacotes UDP.
+            // If the peer stopped screen sharing, close immediately (<50ms) without waiting for UDP timeouts.
             // Anyone who knows the channel can send this presence under any id: while
             // authentic video still comes from that user, it does not end the stream.
             if !is_streaming && was_streaming && super::watch::video_recently_from(pkt_uid) {
-                warn!("📡 [SIGNALING PRESENÇA] UID={} disse que parou, mas o vídeo dele continua chegando: ignorado.", pkt_uid);
+                warn!("📡 [SIGNALING PRESENCE] UID={} reported stopped, but video still arriving: ignored.", pkt_uid);
             } else if !is_streaming && was_streaming {
                 trigger_stream_stopped(pkt_uid);
             }
@@ -230,7 +230,7 @@ pub fn process_signaling_json(
                     }
                 }
             } else {
-                info!("🌐 [P2P WAN ROTEAMENTO] Peer UID={} está em WAN externa ({:?}) - ignorando LANs internas para evitar ICMP reset!", pkt_uid, remote_wan_addr);
+                info!("🌐 [P2P WAN ROUTING] Peer UID={} is on external WAN ({:?}) - ignoring internal LANs to prevent ICMP reset!", pkt_uid, remote_wan_addr);
             }
 
             if !addrs_to_punch.is_empty() {
@@ -254,7 +254,7 @@ pub fn process_signaling_json(
                     }
                 }
 
-                // Dispara burst de UDP Hole Punch imediato pelo socket compartilhado
+                // Fire immediate UDP Hole Punch burst over shared socket
                 if let Some(socket) = get_shared_p2p_socket() {
                     let mut punch_pkt = Vec::with_capacity(32);
                     punch_pkt.extend_from_slice(MAGIC);
@@ -268,7 +268,7 @@ pub fn process_signaling_json(
                     punch_pkt.extend_from_slice(&get_my_rx_port().to_be_bytes());
 
                     for &target in &addrs_to_punch {
-                        info!("🥊 [UDP HOLE PUNCH] Enviando burst de STUN/Punch (10 pacotes) para {} a partir da sinalização", target);
+                        info!("🥊 [UDP HOLE PUNCH] Sending STUN/Punch burst (10 packets) to {} from signaling", target);
                         for _ in 0..10 {
                             let _ = socket.send_to(&punch_pkt, target);
                         }
@@ -350,7 +350,7 @@ pub fn handle_incoming_ws_message(
                 } else if val["op"] == "upgrade_required" {
                     // A newer signaling server parked us: no peers until the app is updated.
                     SIGNALING_PARKED.store(true, Ordering::Relaxed);
-                    warn!("⚠️ [SIGNALING] O servidor de sinalização exige uma versão mais nova do kiyora. Atualize para voltar a transmitir pela internet.");
+                    warn!("⚠️ [SIGNALING] The signaling server requires a version mais nova do kiyora. Atualize para voltar a transmitir pela internet.");
                     return;
                 } else if val["op"] == "room" {
                     let count = val["uids"].as_array().map(|a| a.len()).unwrap_or(0);
@@ -437,7 +437,7 @@ pub async fn run_cloudflare_signaling_loop(
         }
 
         let ws_url = format!("{}/ws?channel={}&user={}&v={}", base_url, cid, my_uid, SIGNALING_PROTOCOL);
-        info!("📡 [SIGNALING] Conectando ao Cloudflare Worker WebSocket em {}...", ws_url);
+        info!("📡 [SIGNALING] Connecting to Cloudflare Worker WebSocket at {}...", ws_url);
 
         let mut req = match ws_url.as_str().into_client_request() {
             Ok(r) => r,
@@ -451,12 +451,12 @@ pub async fn run_cloudflare_signaling_loop(
 
         let (ws_stream, _resp) = match connect_async(req).await {
             Ok((s, r)) => {
-                info!("🛡️ [SIGNALING] Conectado com sucesso ao Cloudflare Edge Signaling (HTTP {}) para canal {}", r.status(), cid);
+                info!("🛡️ [SIGNALING] Connected successfully to Cloudflare Edge Signaling (HTTP {}) for channel {}", r.status(), cid);
                 retry_delay = Duration::from_secs(2);
                 (s, r)
             }
             Err(e) => {
-                warn!("⚠️ [SIGNALING] WebSocket connection failure com Cloudflare: {:?}. Reconectando em {}s...", e, retry_delay.as_secs());
+                warn!("⚠️ [SIGNALING] WebSocket connection failure to Cloudflare: {:?}. Reconnecting in {}s...", e, retry_delay.as_secs());
                 invalidate_cached_stun_address();
                 tokio::time::sleep(retry_delay).await;
                 retry_delay = (retry_delay * 2).min(Duration::from_secs(60));
@@ -486,14 +486,14 @@ pub async fn run_cloudflare_signaling_loop(
 
         loop {
             if channel_id.load(Ordering::Relaxed) != cid {
-                info!("🛑 Canal de voz alterado. Reconectando sala de sinalização...");
+                info!("🛑 Voice channel changed. Reconnecting signaling room...");
                 break;
             }
 
             let fresh_uid = crate::gateway::get_my_user_id();
             if my_uid == 0 && fresh_uid != 0 {
                 my_user_id.store(fresh_uid, Ordering::Relaxed);
-                info!("🔄 [SIGNALING] User ID autenticado ({}). Atualizando conexão com Cloudflare...", fresh_uid);
+                info!("🔄 [SIGNALING] User ID authenticated ({}). Refreshing connection with Cloudflare...", fresh_uid);
                 break;
             }
 
@@ -551,7 +551,7 @@ pub async fn run_cloudflare_signaling_loop(
                         last_addr_check = Instant::now();
                         let now_addrs = current_addrs();
                         if announced.as_ref() != Some(&now_addrs) {
-                            info!("🔀 [SIGNALING] Endereços locais mudaram. Reanunciando presença.");
+                            info!("🔀 [SIGNALING] Local addresses changed. Re-announcing presence.");
                             should_publish = true;
                         }
                         addrs = Some(now_addrs);
@@ -606,11 +606,11 @@ pub async fn run_cloudflare_signaling_loop(
                             handle_incoming_ws_message(msg, cid, my_inst, &peers_store);
                         }
                         Some(Err(e)) => {
-                            warn!("⚠️ Erro de leitura no WebSocket da sinalização: {:?}", e);
+                            warn!("⚠️ WebSocket read error in signaling: {:?}", e);
                             break;
                         }
                         None => {
-                            warn!("⚠️ Servidor de sinalização WebSocket fechou a conexão.");
+                            warn!("⚠️ Signaling WebSocket server closed connection.");
                             break;
                         }
                     }
@@ -622,7 +622,7 @@ pub async fn run_cloudflare_signaling_loop(
             *guard = None;
         }
         invalidate_cached_stun_address();
-        info!("🛑 Desconectado da sala de sinalização Cloudflare para o canal {}. Reconectando...", cid);
+        info!("🛑 Disconnected from Cloudflare signaling room for channel {}. Reconnecting...", cid);
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }

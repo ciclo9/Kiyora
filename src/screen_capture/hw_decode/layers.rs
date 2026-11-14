@@ -1,4 +1,4 @@
-//! Showing GPU-decoded pictures without bringing them back to the CPU (Windows).
+﻿//! Showing GPU-decoded pictures without bringing them back to the CPU (Windows).
 //!
 //! While a window shows a stream decoded on the GPU, DirectComposition layers cover it:
 //! a video layer (a swap chain the video processor converts and scales each decoded
@@ -65,7 +65,7 @@ pub fn present(peer: u64, frame: &Frame, device: &SharedDevice) -> bool {
             Err(e) => {
                 static FAILED: crate::utils::logger::LogThrottle = crate::utils::logger::LogThrottle::new(5000);
                 if FAILED.hit().is_some() {
-                    log::warn!("🎞️ [GPU VIDEO] Falha ao desenhar o quadro na janela: {:?}", e);
+                    log::warn!("🎞️ [GPU VIDEO] Failed to draw frame in window: {:?}", e);
                 }
             }
         }
@@ -364,7 +364,7 @@ impl i_slint_backend_winit::LayerSink for WindowLayers {
         let Some(l) = live.as_mut() else { return };
         let result = unsafe { self.upload(l, pixels, width, height, dirty) };
         if let Err(e) = result {
-            log::warn!("🎞️ [GPU VIDEO] Falha ao enviar a interface para a camada: {:?}", e);
+            log::warn!("🎞️ [GPU VIDEO] Failed to send interface to layer: {:?}", e);
             return;
         }
         unsafe {

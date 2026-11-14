@@ -1,4 +1,4 @@
-﻿use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 use futures_util::{SinkExt, StreamExt};
@@ -111,7 +111,7 @@ async fn exchange_ticket_for_token(
 
     let json: serde_json::Value = res.json()
         .await
-        .map_err(|e| format!("Erro JSON na resposta de login: {:?}", e))?;
+        .map_err(|e| format!("JSON error in login response: {:?}", e))?;
 
     if let Some(enc_token_b64) = json["encrypted_token"].as_str() {
         let enc_bytes = base64::engine::general_purpose::STANDARD.decode(enc_token_b64)
@@ -122,7 +122,7 @@ async fn exchange_ticket_for_token(
             .map_err(|e| format!("Token inválido UTF-8: {:?}", e))?;
         Ok(token_str)
     } else {
-        Err(format!("Resposta sem encrypted_token: {:?}", json))
+        Err(format!("Response missing encrypted_token: {:?}", json))
     }
 }
 
@@ -157,14 +157,14 @@ async fn run_remote_auth_loop(
 
     while let Some(msg_res) = read.next().await {
         if cancel_flag.load(Ordering::SeqCst) {
-            info!("🚫 Sessão de QR Code cancelada pelo usuário.");
+            info!("🚫 QR Code session cancelled by user.");
             let _ = event_tx.send(RemoteAuthEvent::Cancelled).await;
             break;
         }
 
         let msg = match msg_res {
             Ok(m) => m,
-            Err(e) => return Err(format!("Erro de leitura WebSocket: {:?}", e)),
+            Err(e) => return Err(format!("WebSocket read error: {:?}", e)),
         };
 
         if let Message::Text(text) = msg {
@@ -274,7 +274,7 @@ async fn handle_auth_steps(
                                     // format: user_id:discriminator:avatar:username
                                     let parts: Vec<&str> = user_info.split(':').collect();
                                     let username = if parts.len() >= 4 { parts[3].to_string() } else { user_info };
-                                    info!("📲 QR Code escaneado pelo usuário: {}!", username);
+                                    info!("📲 QR Code scanned by user: {}!", username);
                                     let _ = event_tx.send(RemoteAuthEvent::UserScanned { username }).await;
                                 }
                             }
@@ -284,10 +284,10 @@ async fn handle_auth_steps(
                 "pending_login" => {
                     // User tapped "Yes, Log In" on mobile! Exchange ticket via REST API
                     if let Some(ticket) = json["ticket"].as_str() {
-                        info!("🔑 Usuário aprovou o login no celular! Trocando ticket pelo token...");
+                        info!("🔑 User approved login on mobile! Exchanging ticket for token...");
                         match exchange_ticket_for_token(&http_client, ticket, &private_key).await {
                             Ok(token) => {
-                                info!("🎉 Token de acesso recebido via QR Code com sucesso!");
+                                info!("🎉 Access token received via QR Code successfully!");
                                 let _ = event_tx.send(RemoteAuthEvent::TokenReceived(token)).await;
                                 return Ok(());
                             }
@@ -315,7 +315,7 @@ async fn handle_auth_steps(
                     }
                 }
                 "cancel" => {
-                    info!("❌ Login por QR Code rejeitado no celular.");
+                    info!("❌ Mobile QR Code login rejected.");
                     let _ = event_tx.send(RemoteAuthEvent::Cancelled).await;
                     return Ok(());
                 }

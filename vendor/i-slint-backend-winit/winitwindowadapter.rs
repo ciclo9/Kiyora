@@ -441,7 +441,7 @@ impl WinitWindowAdapter {
             let xdg_app_id = WindowInner::from_pub(self.window())
                 .xdg_app_id()
                 .map(|s| s.to_string())
-                .unwrap_or_else(|| "litecord".to_string());
+                .unwrap_or_else(|| "kiyora".to_string());
             #[cfg(feature = "wayland")]
             {
                 use winit::platform::wayland::WindowAttributesExtWayland;

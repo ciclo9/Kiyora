@@ -600,7 +600,7 @@ fn run_wgc(
                 if let Some((pool, session)) = live.take() {
                     let _ = session.Close();
                     let _ = pool.Close();
-                    info!("🖥️ [CAPTURA GPU] Captura WGC pausada: ninguém assistindo e a prévia escondida");
+                    info!("🖥️ [GPU CAPTURE] WGC capture paused: nobody watching e a prévia escondida");
                 }
             }
         }

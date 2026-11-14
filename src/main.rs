@@ -1,4 +1,4 @@
-﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![allow(ambiguous_glob_reexports, unused_imports)]
 
 pub mod auth;
@@ -89,7 +89,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let location = info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column())).unwrap_or_default();
         let msg = format!("💥 PANIC DETECTED: {}\nLocation: {}\n", payload, location);
         eprintln!("{}", msg);
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("panic_log.txt") {
+        let panic_path = crate::utils::logger::get_log_dir().join("panic.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&panic_path) {
             use std::io::Write;
             let _ = writeln!(f, "{}", msg);
         }
@@ -97,6 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     attachment_cache::cleanup_temp_attachments();
     let _ = std::fs::remove_file("panic_log.txt");
+    let _ = std::fs::remove_file("kiyora_app.log");
 
     init_logger();
 
@@ -107,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     utils::timer_resolution::start_timer_resolution_governor();
 
     info!("==================================================================");
-    info!("🚀 kiyora STARTED | VERSION: v{} ({})", env!("CARGO_PKG_VERSION"), env!("kiyora_GIT_HASH"));
+    info!("🚀 Kiyora STARTED | VERSION: v{} ({})", env!("CARGO_PKG_VERSION"), env!("KIYORA_GIT_HASH"));
     info!("==================================================================");
 
     // Renderer: software unless the user turned on GPU rendering (an explicit
@@ -115,7 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var_os("SLINT_BACKEND").is_none() && !video_settings::get_use_gpu_renderer() {
         std::env::set_var("SLINT_BACKEND", "winit-software");
     }
-    info!("🖥️ Initializing Slint AppWindow (renderizador: {})...",
+    info!("🖥️ Initializing Slint AppWindow (renderer: {})...",
         std::env::var("SLINT_BACKEND").unwrap_or_else(|_| "GPU".to_string()));
     let app = match AppWindow::new() {
         Ok(app) => {
@@ -394,7 +396,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tray_action_tx, tray_action_rx) = std::sync::mpsc::channel::<bool>();
     let menu_action_tx = tray_action_tx.clone();
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-        info!("Tray MenuEvent recebido: {:?}", event);
+        info!("Tray MenuEvent received: {:?}", event);
         let action = if event.id == show_id_c {
             true
         } else if event.id == quit_id_c {
@@ -407,7 +409,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let icon_action_tx = tray_action_tx;
     TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
         if matches!(event, TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } | TrayIconEvent::Click { button: MouseButton::Left, .. }) {
-            info!("TrayIconEvent recebido: {:?}", event);
+            info!("TrayIconEvent received: {:?}", event);
             let _ = icon_action_tx.send(true);
         }
     }));
@@ -427,7 +429,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 NEED_UI_REFRESH.store(true, Ordering::Relaxed);
                 utils::wake_hardware_monitor();
                 wake_ui_loops();
-                info!("[DeepSleep] Restauração acionada via Tray — acordando UI.");
+                info!("[DeepSleep] Restore triggered via Tray — waking UI.");
 
                 let app_weak_inner = app_weak_tray.clone();
                 let _hwnd_store_inner = Arc::clone(&hwnd_store_tray);
@@ -535,11 +537,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         // Strict URL protocol validation: only allow HTTP and HTTPS
         if !url.starts_with("http://") && !url.starts_with("https://") {
-            log::warn!("Tentativa de abrir link não-HTTP rejeitada por segurança: {}", url);
+            log::warn!("Attempt to open non-HTTP link rejected for security: {}", url);
             return;
         }
 
-        info!("Abrindo link seguro no navegador padrão: {}", url);
+        info!("Opening secure link in default browser: {}", url);
         #[cfg(target_os = "windows")]
         unsafe {
             let op: Vec<u16> = "open\0".encode_utf16().collect();
@@ -578,7 +580,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.on_popout_stream_window(move |uid_str: slint::SharedString, uname_str: slint::SharedString| {
         let uid = uid_str.to_string();
         let uname = uname_str.to_string();
-        info!("📺 Desanexando transmissão de vídeo para janela Popout! User ID: {}, Nome: {}", uid, uname);
+        info!("📺 Detaching video stream to Popout window! User ID: {}, Name: {}", uid, uname);
         if let Some(ui) = app_weak_pop.upgrade() {
             ui.set_popped_out_stream_uid(uid.clone().into());
             let my_uid = gateway::get_my_user_id().to_string();
@@ -638,7 +640,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(pop) = pop_w_pin.upgrade() {
                 let new_pinned = !pop.get_is_pinned();
                 pop.set_is_pinned(new_pinned);
-                info!("📌 Janela Popout Always-on-Top alterado para: {}", new_pinned);
+                info!("📌 Popout window Always-on-Top changed to: {}", new_pinned);
                 #[cfg(target_os = "windows")]
                 if let Some(hwnd) = *pop_hwnd_pin.lock().unwrap() {
                     unsafe {
@@ -775,9 +777,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = w.set_cursor_hittest(hittest);
             });
             if new_state {
-                info!("👻 Modo Intangível ATIVADO no popup (cliques atravessam para os jogos/apps)!");
+                info!("👻 Click-through mode ENABLED on popup!");
             } else {
-                info!("🖱️ Modo Intangível DESATIVADO no popup (janela volta a receber cliques).");
+                info!("🖱️ Click-through mode DISABLED on popup (window accepts clicks again).");
             }
         }
         if let Some(ui) = app_weak_ghost.upgrade() {
@@ -816,7 +818,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_weak_pop_close = app_weak.clone();
     if let Some(pop_win) = popout_weak.upgrade() {
         pop_win.on_close_popout(move || {
-            info!("📺 Fechando janela Popout e reanexando transmissão à sala principal!");
+            info!("📺 Closing Popout window and reattaching stream to main room!");
             #[cfg(target_os = "windows")]
             if let Some(hwnd) = *pop_hwnd_close.lock().unwrap() {
                 unsafe {
@@ -1238,7 +1240,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app_weak_browser = app_weak.clone();
     app.on_launch_stream_browser(move || {
-        info!("🌐 Abrindo navegador em modo de transmissão (sem travas DRM)...");
+        info!("🌐 Launching browser in streaming mode (DRM-free)...");
         #[cfg(target_os = "windows")]
         {
             let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| "C:\\".to_string());
@@ -1264,7 +1266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .arg("https://www.google.com")
                         .spawn();
                     if res.is_ok() {
-                        info!("🚀 Navegador para transmissão iniciado com sucesso via {}", exe);
+                        info!("🚀 Streaming browser launched successfully via {}", exe);
                         launched = true;
                         break;
                     }
@@ -1392,7 +1394,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hidden_streams_hide = Arc::clone(&hidden_streams);
     app.on_hide_stream(move |uid_str: SharedString| {
         let uid = uid_str.to_string();
-        info!("👁️ Ocultando stream de vídeo do usuário {}", uid);
+        info!("👁️ Hiding video stream for user {}", uid);
         hidden_streams_hide.lock().unwrap().insert(uid.clone());
         // Hiding someone's stream stops receiving it (the sender stops sending to us).
         screen_capture::watch::set_wanted(uid.parse().unwrap_or(0), false);
@@ -1419,7 +1421,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pop_hwnd_unhide = Arc::clone(&popout_hwnd_store);
     app.on_unhide_stream(move |uid_str: SharedString| {
         let uid = uid_str.to_string();
-        info!("👁️ Reexibindo stream de vídeo do usuário {}", uid);
+        info!("👁️ Showing video stream for user {}", uid);
         hidden_streams_unhide.lock().unwrap().remove(uid.as_str());
         // Watch: ask the sender for the stream.
         screen_capture::watch::set_wanted(uid.parse().unwrap_or(0), true);
@@ -1466,7 +1468,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (is_m, _vol) = gateway::get_user_mute_volume(&uid);
         let new_m = !is_m;
         gateway::set_user_mute(&uid, new_m);
-        info!("🎙️ Mute do participante {} alterado para: {}", uid, new_m);
+        info!("🎙️ Participant {} mute set to: {}", uid, new_m);
         if let Some(ui) = app_weak_mute.upgrade() {
             let cur_model = ui.get_voice_participants();
             for i in 0..cur_model.row_count() {
@@ -1513,7 +1515,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_weak_prio = app_weak.clone();
     app.on_set_user_priority(move |uid_str: SharedString, prio: i32| {
         let uid = uid_str.to_string();
-        info!("👑 Prioridade de fala do participante {} alterada para: P:{}", uid, prio);
+        info!("👑 Participant {} priority speaker set to: P:{}", uid, prio);
         gateway::set_user_priority(&uid, prio);
         if let Some(ui) = app_weak_prio.upgrade() {
             let cur_model = ui.get_voice_participants();
@@ -1707,7 +1709,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                                 if !resolved_name.is_empty() {
                                                     gateway::register_user_name(user_id, resolved_name.clone());
-                                                    info!("✅ Nome de usuário/bot resolvido via REST API: {} -> {}", user_id, resolved_name);
+                                                    info!("✅ User/bot name resolved via REST API: {} -> {}", user_id, resolved_name);
                                                 } else {
                                                     if let Ok(mut set) = store_arc.lock() {
                                                         set.remove(&user_id);
@@ -1848,7 +1850,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let ch_id = active_channel_restore.lock().unwrap().clone();
                 let http_opt = http_client_restore.lock().unwrap().clone();
                 if let (false, Some(http)) = (ch_id.is_empty(), http_opt) {
-                    info!("[DeepSleep] Restaurado - re-sincronizando {} mensagem(s) pendente(s) do canal {}.", pending, ch_id);
+                    info!("[DeepSleep] Restored - re-syncing {} pending message(s) from channel {}.", pending, ch_id);
                     let app_w = app_weak_restore.clone();
                     let ch = ch_id.clone();
                     tokio::spawn(async move {
@@ -2088,7 +2090,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     app.on_select_input_device(move |dev_name: SharedString| {
         let name_str = dev_name.to_string();
-        info!("Microfone selecionado: {}", name_str);
+        info!("Microphone selected: {}", name_str);
         *selected_input_store.lock().unwrap() = name_str.clone();
         gateway::set_persisted_input_device(name_str.clone());
 
@@ -2110,7 +2112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let active_loopback_output = Arc::clone(&active_loopback_stream);
     app.on_select_output_device(move |dev_name: SharedString| {
         let name_str = dev_name.to_string();
-        info!("Alto-falante selecionado: {}", name_str);
+        info!("Speakers selected: {}", name_str);
         *selected_output_store.lock().unwrap() = name_str.clone();
         gateway::set_persisted_output_device(name_str.clone());
 
@@ -2148,7 +2150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     app.on_toggle_test_mic(move || {
         let now_testing = !gateway::is_testing_mic();
-        info!("🧪 [TEST MIC] Botão 'Se Ouvir' alternado para: {}", now_testing);
+        info!("🧪 [TEST MIC] 'Hear Yourself' toggled to: {}", now_testing);
         gateway::set_testing_mic(now_testing);
         if let Some(ui) = app_weak_test_mic.upgrade() {
             ui.set_is_testing_mic(now_testing);
@@ -2168,7 +2170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let cur_output = selected_output_test.lock().unwrap().clone();
             info!("🎧 [TEST MIC] Starting loopback output for: '{}'", cur_output);
             if let Some(stream) = start_mic_loopback_stream(cur_output) {
-                info!("🎧 [TEST MIC] Stream de saída criado com sucesso!");
+                info!("🎧 [TEST MIC] Output stream created successfully!");
                 *active_loopback_test.lock().unwrap() = Some(stream);
             } else {
                 log::error!("❌ [TEST MIC] Failed to create loopback stream!");
@@ -2188,7 +2190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ui) = app_weak_lang.upgrade() {
             apply_i18n_translations(&ui, selected);
         }
-        info!("🌐 Idioma alterado para: {:?} (código: {})", selected, code.as_str());
+        info!("🌐 Language changed to: {:?} (code: {})", selected, code.as_str());
     });
 
     let app_weak_rec = app_weak.clone();
@@ -2197,7 +2199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ui) = app_weak_rec.upgrade() {
             ui.set_recording_keybind_for(target);
         }
-        info!("⌨️ [KEYBINDS] Modo gravação alterado para target: {}", target);
+        info!("⌨️ [KEYBINDS] Recording mode changed for target: {}", target);
     });
 
     let keybind_mgr_reset = Arc::clone(&keybind_mgr);
@@ -2219,7 +2221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         keybinds::RECORDING_TARGET.store(0, Ordering::Relaxed);
         keybind_mgr_reset.update_config(cfg);
-        info!("⌨️ [KEYBINDS] Atalho desativado para target: {}", target);
+        info!("⌨️ [KEYBINDS] Shortcut cleared for target: {}", target);
     });
 
     let keybind_mgr_custom = Arc::clone(&keybind_mgr);
@@ -2296,7 +2298,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let report_slot = Arc::clone(&net_diag_report_run);
         let _ = std::thread::Builder::new().name("network-diagnostics".into()).spawn(move || {
             let diag = screen_capture::net_diagnostics::run();
-            info!("🩺 [DIAGNÓSTICO DE REDE]\n{}", diag.report);
+            info!("🩺 [NETWORK DIAGNOSTICS]\n{}", diag.report);
             *report_slot.lock().unwrap() = diag.report;
             let verdict = diag.verdict as i32;
             let signaling_ok = diag.signaling_ms.is_some();
@@ -2476,16 +2478,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(resp) => {
                     let ms = start.elapsed().as_millis();
                     if resp.status().is_success() {
-                        (format!("Sucesso! Conectado ao Discord via proxy em {}ms (Status {})", ms, resp.status()), true)
+                        (format!("Success! Connected to Discord via proxy in {}ms (Status {})", ms, resp.status()), true)
                     } else {
-                        (format!("Proxy respondeu em {}ms, mas retornou status HTTP {}", ms, resp.status()), false)
+                        (format!("Proxy responded in {}ms, but returned HTTP status {}", ms, resp.status()), false)
                     }
                 }
                 Err(e) => {
                     let friendly = if e.is_connect() {
-                        "Falha de conexão: o proxy recusou a conexão ou está offline.".to_string()
+                        "Connection failed: proxy refused connection or is offline.".to_string()
                     } else if e.is_timeout() {
-                        "Tempo esgotado: o servidor proxy demorou para responder.".to_string()
+                        "Connection timed out: proxy server took too long to respond.".to_string()
                     } else {
                         format!("Error connecting via proxy: {}", e)
                     };
@@ -2515,7 +2517,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let active_mic_leave = Arc::clone(&active_mic_stream);
 
     app.on_leave_voice(move || {
-        info!("Usuário solicitou desconexão da sala de voz...");
+        info!("User requested voice channel disconnect...");
         sound_effects::play_ui_sound(sound_effects::UiSound::LeaveChannel);
         // Close the microphone: it was opened on join and kept capturing after leaving.
         *active_mic_leave.lock().unwrap() = None;
@@ -2592,7 +2594,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 current_msgs.push(ChatMessage {
                     id: "".into(),
                     author: "kiyora Voice".into(),
-                    content: "🔴 Desconectado da sala de voz.".into(),
+                    content: "🔴 Disconnected from voice channel.".into(),
                     commands: slint::ModelRc::default(),
                     content_lines: slint::ModelRc::default(),
                     embed_content: "".into(),
@@ -2673,7 +2675,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(e) = http.ring_dm_call(&ch_id).await {
                     warn!("Warning when firing ring on DM {}: {:?} (voice call still active)", ch_id, e);
                 } else {
-                    info!("🔔 DM ring iniciado com sucesso no canal {}", ch_id);
+                    info!("🔔 DM ring started successfully on channel {}", ch_id);
                 }
             }
         });
@@ -2706,7 +2708,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(e) = http.stop_ringing_dm_call(&ch_id2).await {
                     warn!("Failed to stop ring on DM {}: {:?}", ch_id2, e);
                 } else {
-                    info!("🔕 DM ring parado no canal {}", ch_id2);
+                    info!("🔕 DM ring stopped on channel {}", ch_id2);
                 }
             }
         });
@@ -3061,14 +3063,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
                 }
                 RemoteAuthEvent::TokenReceived(token) => {
-                    info!("🎉 Token de acesso recebido via QR Code com sucesso! Conectando...");
+                    info!("🎉 Access token received via QR Code successfully! Connecting...");
                     let app_w = app_weak_qr.clone();
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = app_w.upgrade() {
                             ui.set_has_qr_code(false);
                             ui.set_qr_scanned_user("".into());
                             ui.set_login_alert_message("".into());
-                            ui.set_connection_status("Conectando via QR Code...".into());
+                            ui.set_connection_status("Connecting via QR Code...".into());
                         }
                     });
                     if let Some(old) = active_qr_session_qr.lock().unwrap().take() {
@@ -3098,7 +3100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
                 }
                 RemoteAuthEvent::Error(err) => {
-                    warn!("⚠️ Erro na sessão de QR Auth: {}", err);
+                    warn!("⚠️ QR Auth session error: {}", err);
                     let app_w = app_weak_qr.clone();
                     let err_clone = err.clone();
                     let _ = slint::invoke_from_event_loop(move || {
@@ -3111,7 +3113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 ui.set_login_alert_message(crate::utils::i18n_ui::ui_text().qr_captcha.into());
                                 ui.set_login_alert_is_error(true);
                             } else {
-                                ui.set_login_alert_message(format!("Falha no QR Code: {}", err_clone).into());
+                                ui.set_login_alert_message(format!("QR Code authentication failed: {}", err_clone).into());
                                 ui.set_login_alert_is_error(true);
                             }
                         }
@@ -3135,7 +3137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let active_qr_logout = Arc::clone(&active_qr_session);
 
     app.on_logout(move || {
-        info!("Usuário solicitou Logout completo de todas as contas...");
+        info!("User requested sign out from all accounts...");
         // 1. Remove saved vault file so all saved tokens are wiped
         delete_secure_token();
 
@@ -3217,7 +3219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     app.on_switch_account(move |account_id: SharedString| {
         let acc_id_str = account_id.to_string();
-        info!("🔄 Alternando para a conta com identificador {}...", acc_id_str);
+        info!("🔄 Switching to account {}...", acc_id_str);
 
         let mut vault = load_account_vault();
         let mut target_token = String::new();
@@ -3232,7 +3234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if !found {
-            warn!("Conta {} não encontrada no cofre.", acc_id_str);
+            warn!("Account {} not found in vault.", acc_id_str);
             return;
         }
         save_account_vault(&vault);
@@ -3325,7 +3327,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let active_qr_add = Arc::clone(&active_qr_session);
 
     app.on_add_new_account(move || {
-        info!("➕ Usuário solicitou adicionar nova conta...");
+        info!("➕ User requested adding new account...");
         // Disconnect voice session if active
         gateway::clear_voice_participants();
         gateway::CURRENT_VOICE_SESSION_ID.store(0, std::sync::atomic::Ordering::SeqCst);
@@ -3366,7 +3368,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.set_user_avatar_has_image(false);
             ui.set_user_avatar_img(slint::Image::default());
             ui.set_user_avatar_url("".into());
-            ui.set_connection_status("Conecte a nova conta escaneando o QR Code ou inserindo o Token.".into());
+            ui.set_connection_status("Connect a new account by scanning the QR code or entering a token.".into());
             ui.set_is_in_voice(false);
             ui.set_current_voice_channel("".into());
             ui.set_show_user_menu(false);
@@ -3392,7 +3394,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_weak_rem = app_weak.clone();
     app.on_remove_account(move |account_id: SharedString| {
         let acc_id_str = account_id.to_string();
-        info!("🗑️ Removendo conta {} do cofre...", acc_id_str);
+        info!("🗑️ Removing account {} from vault...", acc_id_str);
         let vault = remove_single_account(&acc_id_str);
         sync_ui_saved_accounts(&app_weak_rem, &vault);
     });
@@ -3410,7 +3412,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     app.on_login(move |token: SharedString| {
         let token_str = token.to_string().chars().filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'').collect::<String>();
-        info!("Token fornecido. Validando via API HTTP...");
+        info!("Token provided. Validating via HTTP API...");
         *last_token_login.lock().unwrap() = token_str.clone();
 
         if let Some(old) = active_qr_login.lock().unwrap().take() {
@@ -3421,7 +3423,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         *http_client_clone.lock().unwrap() = Some(http.clone());
 
         if let Some(ui) = app_weak_login.upgrade() {
-            ui.set_connection_status("Validando Token na API do Discord...".into());
+            ui.set_connection_status("Validating Token with Discord API...".into());
         }
 
         let event_tx_gw = event_tx_clone.clone();
@@ -3451,7 +3453,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         tag.clone()
                     };
-                    info!("Token VÁLIDO! Usuário autenticado: {} ({})", username, user_id);
+                    info!("Token VALID! Authenticated user: {} ({})", username, user_id);
 
                     let vault = save_or_update_account(&token_str, user_id, global_name, &tag);
                     sync_ui_saved_accounts(&app_weak_inner, &vault);
@@ -3487,7 +3489,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 ui.set_user_avatar_has_image(true);
                                 }
                             }
-                            ui.set_connection_status("Conectado com sucesso!".into());
+                            ui.set_connection_status("Connected successfully!".into());
                             ui.set_login_alert_message("".into());
                             ui.set_titlebar_error("".into());
                         }
@@ -3609,9 +3611,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         let net = crate::utils::get_network_settings();
         if net.proxy_mode != "off" {
-            info!("🌐 Verificando conectividade do proxy configurado ({}: {}:{})...", net.proxy_mode, net.proxy_host, net.proxy_port);
+            info!("🌐 Checking proxy connectivity ({}: {}:{})...", net.proxy_mode, net.proxy_host, net.proxy_port);
             if let Err(e) = crate::utils::test_proxy_connection().await {
-                warn!("⚠️ Proxy ativo ({}) inacessível no início da aplicação: {}", net.proxy_mode, e);
+                warn!("⚠️ Active proxy ({}) unreachable on startup: {}", net.proxy_mode, e);
                 let proxy_msg = crate::utils::format_proxy_alert_message();
                 let app_w = app_weak_proxy_check.clone();
                 let _ = slint::invoke_from_event_loop(move || {
@@ -3688,7 +3690,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     app.on_select_guild(move |guild_id: SharedString| {
         let gid = guild_id.to_string();
-        info!("Servidor selecionado pelo usuário: {}", gid);
+        info!("Guild selected by user: {}", gid);
 
         if let Some(ui) = app_weak_guild_select.upgrade() {
             ui.set_is_voice_focused(false);
@@ -3750,7 +3752,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     app.on_toggle_category(move |cat_id_str: SharedString| {
         let cat_id = cat_id_str.to_string();
-        info!("Alternando estado da categoria de canais: {}", cat_id);
+        info!("Toggling channel category: {}", cat_id);
         let cats_store = get_collapsed_categories();
         {
             let mut cats_guard = cats_store.lock().unwrap();
@@ -3799,7 +3801,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = std::fs::write(".kiyora_guild_order.json", json);
                 }
                 ui.set_guilds(std::rc::Rc::new(slint::VecModel::from(list)).into());
-                info!("🔄 Servidores reordenados de {} para {} e persistidos em .kiyora_guild_order.json", from, to);
+                info!("🔄 Guilds reordered from {} to {} and persisted to .kiyora_guild_order.json", from, to);
             }
         }
     });
@@ -3842,7 +3844,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(ui) = app_weak_reorder_c.upgrade() {
                         ui.set_channels(std::rc::Rc::new(slint::VecModel::from(ui_channels)).into());
                     }
-                    info!("🔄 Canais do servidor {} reordenados e persistidos localmente!", gid);
+                    info!("🔄 Channels in guild {} reordered and persisted locally!", gid);
                 }
             }
         }
@@ -3852,7 +3854,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     app.on_select_channel(move |channel_id: SharedString| {
         let ch_id = channel_id.to_string();
-        info!("Canal selecionado pelo usuário: {}", ch_id);
+        info!("Channel selected by user: {}", ch_id);
         *active_channel_chan_select.lock().unwrap() = ch_id.clone();
 
         let gid = active_guild_chan_select.lock().unwrap().clone();
@@ -3861,7 +3863,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|g| g.channels.iter().find(|c| c.id == ch_id).cloned());
 
         let is_voice = target_channel.as_ref().map(|c| c.is_voice).unwrap_or(false);
-        let ch_name = target_channel.as_ref().map(|c| c.name.clone()).unwrap_or_else(|| "canal".to_string());
+        let ch_name = target_channel.as_ref().map(|c| c.name.clone()).unwrap_or_else(|| "channel".to_string());
 
         if let Some(ui) = app_weak_chan_select.upgrade() {
             if is_voice {
@@ -3905,7 +3907,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 current_msgs.push(ChatMessage {
                     id: "".into(),
                     author: "kiyora Voice".into(),
-                    content: format!("🔊 Entrou no canal de voz: {}", ch_name).into(),
+                    content: format!("🔊 Joined voice channel: {}", ch_name).into(),
                     commands: slint::ModelRc::default(),
                     content_lines: slint::ModelRc::default(),
                     embed_content: "".into(),
@@ -4301,12 +4303,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_weak_tray_min = app_weak.clone();
     let hwnd_store_minimize = Arc::clone(&hwnd_store);
     app.on_minimize_to_tray(move || {
-        info!("Minimizando janela para a bandeja do sistema via Win32 SW_HIDE...");
+        info!("Minimizing window to System Tray via Win32 SW_HIDE...");
         crate::ui::window_place::save_now();
         crate::ui::invite_cards::clear();
         APP_IS_VISIBLE.store(false, Ordering::Relaxed);
         PENDING_MESSAGES.store(0, Ordering::Relaxed);
-        info!("[DeepSleep] UI loops suspensos. Apenas áudio permanece ativo.");
+        info!("[DeepSleep] UI loops suspended. Audio remains active.");
         let app_w = app_weak_tray_min.clone();
         let hwnd_store_c = Arc::clone(&hwnd_store_minimize);
         slint::Timer::single_shot(std::time::Duration::from_millis(50), move || {
@@ -4331,7 +4333,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             trim_process_memory();
-            info!("[DeepSleep] Memória RAM compactada e liberada (minimize to tray)!");
+            info!("[DeepSleep] RAM compacted and trimmed (minimize to tray)!");
         });
     });
 
@@ -4392,10 +4394,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_weak_min = app_weak.clone();
     let hwnd_store_min = Arc::clone(&hwnd_store);
     app.on_minimize_window(move || {
-        info!("🔕 Minimizando janela para a bandeja do sistema (System Tray) & entrando em DeepSleep...");
+        info!("🔕 Minimizing to System Tray & entering DeepSleep...");
         APP_IS_VISIBLE.store(false, Ordering::Relaxed);
         PENDING_MESSAGES.store(0, Ordering::Relaxed);
-        info!("[DeepSleep] UI loops suspensos. Apenas áudio permanece ativo.");
+        info!("[DeepSleep] UI loops suspended. Audio remains active.");
         let app_w = app_weak_min.clone();
         let hwnd_store_c = Arc::clone(&hwnd_store_min);
         slint::Timer::single_shot(std::time::Duration::from_millis(50), move || {
@@ -4421,7 +4423,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             trim_process_memory();
-            info!("[DeepSleep] Memória RAM compactada e liberada ao minimizar!");
+            info!("[DeepSleep] RAM compacted and trimmed on minimize!");
         });
     });
 
@@ -4437,7 +4439,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let sm_for_close = Arc::clone(&screen_manager);
     app.on_close_window(move || {
-        info!("Fechar clicado na barra superior: saindo do aplicativo...");
+        info!("Titlebar close clicked: exiting application...");
         crate::ui::window_place::save_now();
         sm_for_close.stop();
         #[cfg(target_os = "linux")]
@@ -4472,7 +4474,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         sm_disc.set_context(0, 0, "");
                         screen_capture::clear_stream_audio_queue();
                         if let Some(ui) = app_w.upgrade() {
-                            info!("🚪 Desconectando UI do canal de voz (sessão encerrada/deslocada por outro cliente)");
+                            info!("🚪 Disconnecting UI from voice channel (session ended/taken over by another client)");
                             ui.set_is_in_voice(false);
                             ui.set_is_voice_connecting(false);
                             ui.set_is_screen_sharing(false);
@@ -4489,7 +4491,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tokio::spawn(async {
                         tokio::time::sleep(std::time::Duration::from_secs(8)).await;
                         trim_process_memory();
-                        info!("🧹 [MEMÓRIA] Faxina pós-login concluída.");
+                        info!("🧹 [MEMORY] Post-login cleanup complete.");
                     });
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = app_weak_inner.upgrade() {
@@ -4505,11 +4507,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = app_weak_inner.upgrade() {
                             let clean_reason = if reason_clone.contains("10054") || reason_clone.contains("ConnectionReset") || reason_clone.contains("reset by peer") {
-                                "Conexão reiniciada".to_string()
+                                "Connection reset".to_string()
                             } else if reason_clone.contains("timeout") || reason_clone.contains("TimedOut") {
-                                "Sem internet / Timeout".to_string()
+                                "No internet / Timeout".to_string()
                             } else {
-                                format!("Desconectado ({})", reason_clone)
+                                format!("Disconnected ({})", reason_clone)
                             };
                             ui.set_titlebar_error(clean_reason.into());
                         }
@@ -4586,7 +4588,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Window is hidden — count message but don't touch Slint.
                         // Messages will be re-fetched via REST when the window is restored.
                         let pending = PENDING_MESSAGES.fetch_add(1, Ordering::Relaxed) + 1;
-                        info!("[DeepSleep] Mensagem recebida em background ({} pendente(s)) — UI ignorada.", pending);
+                        info!("[DeepSleep] Message received in background ({} pending) — UI skipped.", pending);
                     } else {
                         let _ = slint::invoke_from_event_loop(move || {
                             if let Some(ui) = app_weak_inner.upgrade() {

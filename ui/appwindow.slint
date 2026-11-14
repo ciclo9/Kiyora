@@ -1,4 +1,4 @@
-﻿import { Tr } from "components/tr.slint";
+import { Tr } from "components/tr.slint";
 export { Tr }
 import { Button, VerticalBox, HorizontalBox, LineEdit, ScrollView, ListView, TextEdit, CheckBox, Slider } from "std-widgets.slint";
 import { AppTheme, ChatTypography, ThemeMode , TypeScale } from "theme.slint";
@@ -424,8 +424,8 @@ export component AppWindow inherits Window {
     in-out property <[LanguageItem]> languages: [];
     in-out property <[AudioDeviceItem]> input_devices: [];
     in-out property <[AudioDeviceItem]> output_devices: [];
-    in-out property <string> selected_input_device: "Microfone Padrão do Sistema";
-    in-out property <string> selected_output_device: "Alto-falantes Padrão do Sistema";
+    in-out property <string> selected_input_device: "Default System Microphone";
+    in-out property <string> selected_output_device: "Default System Speakers";
     in-out property <float> mic_level: 0.0; // Real-time mic volume level (0.0 to 1.0)
     in-out property <float> mic_volume: 1.0; // Microphone Input Gain Volume (0.0 to 2.0, 100% = 1.0)
     in-out property <float> vad_threshold: 0.05; // Voice Activity Detection Threshold (0.0 to 1.0)
@@ -541,9 +541,8 @@ export component AppWindow inherits Window {
                             alignment: center;
                             Image {
                                 source: @image-url("../assets/app_icon.png");
-                                width: 16px;
-                                height: 16px;
-                                colorize: AppTheme.text-strong;
+                                width: 22px;
+                                height: 22px;
                                 image-fit: contain;
                             }
                         }
@@ -853,21 +852,33 @@ export component AppWindow inherits Window {
 
                                 HorizontalLayout {
                                     alignment: start;
-                                    spacing: 10px;
+                                    spacing: 14px;
 
                                     Image {
                                         source: @image-url("../assets/app_icon.png");
-                                        width: 26px;
-                                        height: 26px;
+                                        width: 52px;
+                                        height: 52px;
                                         image-fit: contain;
                                     }
 
-                                    Text {
-                                        text: root.tr_login_title;
-                                        color: AppTheme.text-strong;
-                                        font-size: TypeScale.heading;
-                                        font-weight: 700;
-                                        vertical-alignment: center;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 2px;
+
+                                        Text {
+                                            text: "Kiyora";
+                                            color: AppTheme.accent;
+                                            font-size: 22px;
+                                            font-weight: 800;
+                                        }
+
+                                        Text {
+                                            text: root.tr_login_title;
+                                            color: AppTheme.text-strong;
+                                            font-size: TypeScale.heading;
+                                            font-weight: 600;
+                                            vertical-alignment: center;
+                                        }
                                     }
                                 }
 

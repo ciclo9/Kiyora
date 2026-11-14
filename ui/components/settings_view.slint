@@ -1,4 +1,4 @@
-﻿import { ScrollView, Slider } from "std-widgets.slint";
+import { ScrollView, Slider } from "std-widgets.slint";
 import { AppTheme, TypeScale } from "../theme.slint";
 import { Tr } from "tr.slint";
 import {
@@ -653,9 +653,34 @@ export component SettingsView inherits Rectangle {
                                 border-color: AppTheme.border-subtle;
                                 VerticalLayout {
                                     padding: 16px;
-                                    spacing: 10px;
+                                    spacing: 14px;
+                                    HorizontalLayout {
+                                        spacing: 14px;
+                                        alignment: start;
+                                        Image {
+                                            source: @image-url("../../assets/app_icon.png");
+                                            width: 48px;
+                                            height: 48px;
+                                            image-fit: contain;
+                                        }
+                                        VerticalLayout {
+                                            alignment: center;
+                                            spacing: 3px;
+                                            Text {
+                                                text: "Kiyora " + root.app_version;
+                                                color: AppTheme.text-strong;
+                                                font-size: TypeScale.heading;
+                                                font-weight: 700;
+                                            }
+                                            Text {
+                                                text: "Ultra-lightweight native Discord client for Windows 10/11";
+                                                color: AppTheme.text-muted;
+                                                font-size: TypeScale.caption;
+                                            }
+                                        }
+                                    }
                                     SettingsRow {
-                                        title: "kiyora " + root.app_version;
+                                        title: Tr.check_updates;
                                         desc: Tr.release_channel_desc;
                                         SettingsButton {
                                             text: root.is_checking_update ? Tr.checking : Tr.check_updates;

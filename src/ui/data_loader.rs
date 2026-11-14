@@ -1,4 +1,4 @@
-﻿#![allow(dead_code)]
+#![allow(dead_code)]
 
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
@@ -33,20 +33,20 @@ pub async fn fetch_and_populate_guilds(
     active_channel_id: Arc<Mutex<String>>,
     cmd_tx_store: Arc<Mutex<Option<mpsc::Sender<GatewayCommand>>>>,
 ) {
-    info!("Buscando servidores do usuário via REST API...");
+    info!("Fetching user guilds via REST API...");
     let cache_dir = std::path::Path::new(".kiyora_cache/icons");
     let _ = std::fs::create_dir_all(cache_dir);
 
     match http.get_user_guilds().await {
         Ok(guilds_json) => {
-            info!("{} servidores encontrados via REST!", guilds_json.len());
+            info!("{} guilds found via REST!", guilds_json.len());
             let mut raw_guilds: Vec<RawGuildItem> = Vec::new();
             let mut first_guild_id_opt: Option<String> = None;
             let mut pending_icon_downloads: Vec<(String, String)> = Vec::new();
 
             for g in guilds_json {
                 let g_id = g["id"].as_str().unwrap_or("").to_string();
-                let g_name = g["name"].as_str().unwrap_or("Servidor").to_string();
+                let g_name = g["name"].as_str().unwrap_or("Server").to_string();
                 let g_icon_hash = g["icon"].as_str().map(|s| s.to_string());
 
                 if !g_id.is_empty() {
@@ -80,7 +80,7 @@ pub async fn fetch_and_populate_guilds(
                 }
             }
 
-            // 📌 Ordenação Nativa do Discord / Persistência Local
+            // 📌 Native Discord Sorting / Local Persistence
             let mut ordered_ids: Vec<String> = Vec::new();
             if let Ok(data) = std::fs::read_to_string(".kiyora_guild_order.json") {
                 if let Ok(ids) = serde_json::from_str::<Vec<String>>(&data) {
@@ -195,7 +195,7 @@ pub async fn fetch_and_populate_guilds(
                 });
             }
 
-            // Pré-carrega o cache de canais de DMs (@me) em background para detecção imediata de mensagens diretas
+            // Preload DM channel cache (@me) in background for instant direct message detection
             let http_dms = http.clone();
             let gmap_dms = guilds_map.clone();
             tokio::spawn(async move {
@@ -217,20 +217,20 @@ pub async fn fetch_and_populate_channels(
     cmd_tx_store: Arc<Mutex<Option<mpsc::Sender<GatewayCommand>>>>,
     guild_id: &str,
 ) {
-    info!("Buscando canais do servidor {} via REST API...", guild_id);
+    info!("Fetching channels for guild {} via REST API...", guild_id);
     *active_guild_id.lock().unwrap() = guild_id.to_string();
 
     let g_name = guilds_map.lock().unwrap()
         .get(guild_id)
         .map(|g| g.name.clone())
-        .unwrap_or_else(|| "Servidor".to_string());
+        .unwrap_or_else(|| "Server".to_string());
 
     let app_w_top = app_weak.clone();
     let g_name_top = g_name.clone();
     let g_id_top = guild_id.to_string();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(ui) = app_w_top.upgrade() {
-            ui.set_connection_status(format!("Servidor: {} | Gateway v9 (Online)", g_name_top).into());
+            ui.set_connection_status(format!("Server: {} | Gateway v9 (Online)", g_name_top).into());
             ui.set_active_guild_name(g_name_top.into());
             ui.set_active_guild_id(g_id_top.into());
         }
@@ -257,7 +257,7 @@ pub async fn fetch_and_populate_channels(
 
     let chans_json = match chans_res {
         Ok(chans) => {
-            info!("{} canais encontrados no servidor!", chans.len());
+            info!("{} channels found on guild!", chans.len());
             chans
         }
         Err(e) => {
@@ -270,10 +270,10 @@ pub async fn fetch_and_populate_channels(
         Err(err) => {
             if !cached.is_empty() {
                 // The cached list stays on screen.
-                error!("Não foi possível verificar permissões do servidor: {}", err);
+                error!("Could not verify guild permissions: {}", err);
                 return;
             }
-            error!("Não foi possível verificar permissões do servidor: {}", err);
+            error!("Could not verify guild permissions: {}", err);
             *active_channel_id.lock().unwrap() = String::new();
             if let Some(guild) = guilds_map.lock().unwrap().get_mut(guild_id) {
                 guild.channels.clear();
@@ -310,7 +310,7 @@ pub async fn fetch_and_populate_channels(
 
     for ch in chans_json {
         let ch_id = ch["id"].as_str().unwrap_or("").to_string();
-        let ch_name = ch["name"].as_str().unwrap_or("canal").to_string();
+        let ch_name = ch["name"].as_str().unwrap_or("channel").to_string();
         let ch_type = ch["type"].as_u64().unwrap_or(0);
         let parent_id = ch["parent_id"].as_str().map(|s| s.to_string());
         let position = ch["position"].as_i64().unwrap_or(0);
@@ -330,7 +330,7 @@ pub async fn fetch_and_populate_channels(
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(err) => {
-                    error!("Canal {} omitido: {}", ch_id, err);
+                    error!("Channel {} omitted: {}", ch_id, err);
                     continue;
                 }
             }
@@ -469,7 +469,7 @@ pub async fn fetch_and_populate_channels(
                 let empty_msgs = vec![ChatMessage {
                     id: "".into(),
                     author: "kiyora System".into(),
-                    content: "Este servidor não possui canais de texto acessíveis para a sua conta.".into(),
+                    content: "This server has no text channels accessible for your account.".into(),
                     commands: slint::ModelRc::default(),
                     content_lines: slint::ModelRc::default(),
                     embed_content: "".into(),
@@ -575,7 +575,7 @@ async fn preload_guild_members(http: &DiscordHttpClient, guild_id: &str) {
                 }
             }
         }
-        info!("✅ Membros e Bots do servidor {} pre-carregados via REST API com SUCESSO!", guild_id);
+        info!("✅ Guild {} members and bots preloaded via REST API successfully!", guild_id);
     }
 }
 
@@ -586,13 +586,13 @@ pub async fn fetch_and_populate_dms(
     active_guild_id: Arc<Mutex<String>>,
     active_channel_id: Arc<Mutex<String>>,
 ) {
-    info!("Buscando conversas de DM via REST API (/users/@me/channels)...");
+    info!("Fetching DM conversations via REST API (/users/@me/channels)...");
     *active_guild_id.lock().unwrap() = "@me".to_string();
 
     let app_w_top = app_weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(ui) = app_w_top.upgrade() {
-            ui.set_connection_status("Mensagens Diretas | Gateway v9 (Online)".into());
+            ui.set_connection_status("Direct Messages | Gateway v9 (Online)".into());
             ui.set_active_guild_name("Direct Messages".into());
             ui.set_active_guild_id("@me".into());
         }
@@ -600,10 +600,10 @@ pub async fn fetch_and_populate_dms(
 
     match http.get_user_dms().await {
         Ok(dms_json) => {
-            info!("{} conversas de DM encontradas via REST!", dms_json.len());
+            info!("{} DM conversations found via REST!", dms_json.len());
 
             let mut dms_sorted = dms_json;
-            // Ordena por last_message_id descrescente (Snowflake maior = mensagem mais recente)
+            // Sort by descending last_message_id (larger Snowflake = newer message)
             dms_sorted.sort_by(|a, b| {
                 let a_id: u64 = a["last_message_id"].as_str()
                     .unwrap_or("0")
@@ -706,7 +706,7 @@ pub async fn fetch_and_populate_dms(
                 });
             }
 
-            // Registra @me no mapa para que on_select_channel funcione transparentemente
+            // Register @me in map so on_select_channel works transparently
             guilds_map.lock().unwrap().insert("@me".to_string(), GuildData {
                 id: "@me".to_string(),
                 name: "Direct Messages".to_string(),
@@ -723,7 +723,7 @@ pub async fn fetch_and_populate_dms(
                 }
             });
 
-            // Se nenhum canal estiver selecionado ou o atual não estiver na lista de DMs, seleciona a 1ª
+            // If no channel selected or current is not in DMs list, select the 1st
             let current_c = active_channel_id.lock().unwrap().clone();
             let target_ch_id = if current_c.is_empty() || !ui_channels.iter().any(|c| c.id == current_c.as_str()) {
                 first_ch_id_opt
@@ -799,7 +799,7 @@ pub async fn load_messages_for_channel(
     app_weak: slint::Weak<AppWindow>,
     channel_id: &str,
 ) -> bool {
-    info!("Carregando mensagens do canal {}...", channel_id);
+    info!("Loading messages for channel {}...", channel_id);
     emoji_cache::get_emoji_cache().set_active_channel(channel_id);
     let ch_id_for_emojis = channel_id.to_string();
     let app_weak_load = app_weak.clone();
@@ -821,7 +821,7 @@ pub async fn load_messages_for_channel(
                         vec![ChatMessage {
                             id: "".into(),
                             author: "kiyora System".into(),
-                            content: "Este canal está vazio ou não possui mensagens recentes.".into(),
+                            content: "This channel is empty or has no recent messages.".into(),
                             commands: slint::ModelRc::default(),
                             content_lines: slint::ModelRc::default(),
                             embed_content: "".into(),
@@ -892,9 +892,9 @@ pub async fn load_messages_for_channel(
         Err(err) => {
             error!("Error loading channel {} messages: {}", channel_id, err);
             let friendly_msg = if err.contains("403") || err.contains("Forbidden") {
-                "Canal Privado\nEste canal é restrito e exige cargos específicos no servidor para visualizar as mensagens.".to_string()
+                "Private Channel\nThis channel is restricted and requires specific roles on the server to view messages.".to_string()
             } else {
-                format!("Não foi possível carregar as mensagens ({})", err)
+                format!("Could not load messages ({})", err)
             };
 
             let _ = slint::invoke_from_event_loop(move || {
@@ -973,7 +973,7 @@ pub async fn try_login_with_candidates(
                 } else {
                     tag.clone()
                 };
-                info!("Token VÁLIDO ENCONTRADO! Conectado como {} ({})", username, user_id);
+                info!("VALID TOKEN FOUND! Connected as {} ({})", username, user_id);
 
                 let vault = save_or_update_account(&token_str, user_id, global_name, &tag);
                 sync_ui_saved_accounts(&app_weak, &vault);
@@ -1012,7 +1012,7 @@ pub async fn try_login_with_candidates(
                                 ui.set_user_avatar_has_image(true);
                             }
                         }
-                        ui.set_connection_status("Conectado com sucesso!".into());
+                        ui.set_connection_status("Connected successfully!".into());
                         ui.set_login_alert_message("".into());
                         ui.set_titlebar_error("".into());
                     }

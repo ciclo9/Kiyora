@@ -235,7 +235,7 @@ fn play_sound_cpal(sound: UiSound) -> Result<(), Box<dyn std::error::Error + Sen
             .or_else(|| host.default_output_device())
     } else {
         host.default_output_device()
-    }.ok_or_else(|| "Nenhum dispositivo de áudio de saída encontrado")?;
+    }.ok_or_else(|| "No audio output device found")?;
 
     let config = device.default_output_config()?;
     let sample_rate = config.sample_rate().0;
@@ -269,7 +269,7 @@ fn play_sound_cpal(sound: UiSound) -> Result<(), Box<dyn std::error::Error + Sen
                     }
                 }
             },
-            |err| warn!("Erro no stream de som CPAL: {}", err),
+            |err| warn!("CPAL sound stream error: {}", err),
             None,
         )?,
         cpal::SampleFormat::I16 => device.build_output_stream(
@@ -289,10 +289,10 @@ fn play_sound_cpal(sound: UiSound) -> Result<(), Box<dyn std::error::Error + Sen
                     }
                 }
             },
-            |err| warn!("Erro no stream de som CPAL: {}", err),
+            |err| warn!("CPAL sound stream error: {}", err),
             None,
         )?,
-        _ => return Err("Formato de áudio não suportado para UI sounds".into()),
+        _ => return Err("Unsupported audio format for UI sounds".into()),
     };
 
     stream.play()?;

@@ -133,7 +133,7 @@ fn apply(layers: &WindowLayers, wants: bool, peer: u64, set_hole: impl Fn(bool))
             Err(e) => log::warn!("🎞️ [GPU VIDEO] Não foi possível ligar as camadas de vídeo: {:?}", e),
         }
     } else if !wants && layers.is_active() {
-        log::info!("🎞️ [GPU VIDEO] Transmissão volta a ser exibida pela CPU");
+        log::info!("🎞️ [GPU VIDEO] Stream returned to CPU display");
         layers.stop();
         set_hole(false);
     }

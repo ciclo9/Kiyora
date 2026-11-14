@@ -1,17 +1,30 @@
+use std::sync::Mutex;
+use std::path::PathBuf;
+
+pub fn get_log_dir() -> PathBuf {
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        PathBuf::from(local).join("Kiyora").join("logs")
+    } else {
+        std::env::temp_dir().join("Kiyora").join("logs")
+    }
+}
+
 pub fn init_logger() {
-    use std::sync::Mutex;
+    let log_dir = get_log_dir();
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_file_path = log_dir.join("kiyora.log");
+
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open("kiyora_app.log")
+        .open(&log_file_path)
         .ok();
+
     let logger = AppLogger { file: Mutex::new(log_file) };
     let _ = log::set_boxed_logger(Box::new(logger));
     log::set_max_level(log::LevelFilter::Info);
 }
-
-use std::sync::Mutex;
 
 pub struct AppLogger {
     pub file: Mutex<Option<std::fs::File>>,

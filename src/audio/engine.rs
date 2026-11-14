@@ -1,4 +1,4 @@
-﻿#![allow(dead_code)]
+#![allow(dead_code)]
 
 use tokio::sync::mpsc;
 
@@ -36,11 +36,11 @@ pub(crate) fn linux_voice_stream_config(
     };
     match probe {
         Ok(()) => {
-            info!("Buffer de voz Linux aceito: {} frames ({})", frames, if input { "entrada" } else { "saída" });
+            info!("Linux voice buffer accepted: {} frames ({})", frames, if input { "entrada" } else { "saída" });
             fixed
         },
         Err(error) => {
-            log::warn!("Buffer de voz Linux de {} frames recusado ({error}); usando padrão do driver", frames);
+            log::warn!("Linux voice buffer of {} frames recusado ({error}); usando padrão do driver", frames);
             let mut fallback: cpal::StreamConfig = config.clone().into();
             fallback.buffer_size = cpal::BufferSize::Default;
             fallback
@@ -95,11 +95,11 @@ pub fn enumerate_audio_devices() -> (Vec<String>, Vec<String>) {
     }
 
     if inputs.is_empty() {
-        inputs.push("Microfone Padrão do Sistema".to_string());
+        inputs.push("Default System Microphone".to_string());
     }
 
     if outputs.is_empty() {
-        outputs.push("Alto-falantes Padrão do Sistema".to_string());
+        outputs.push("Default System Speakers".to_string());
     }
 
     let result = (inputs, outputs);
@@ -167,7 +167,7 @@ pub fn start_mic_capture(device_name: String, level_tx: mpsc::Sender<f32>) -> Mi
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     #[cfg(feature = "automation")]
     if crate::utils::test_hooks::mic_synth() {
-        info!("🧪 [TEST MIC] Tom sintético no lugar do microfone.");
+        info!("🧪 [TEST MIC] Synthetic tone in place of microphone.");
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let gen_stop = Arc::clone(&stop);
         let _ = std::thread::Builder::new().name("mic-synth".into())
@@ -181,7 +181,7 @@ pub fn start_mic_capture(device_name: String, level_tx: mpsc::Sender<f32>) -> Mi
     let spawned = std::thread::Builder::new().name("mic-capture-owner".into()).spawn(move || {
         let stream = open_mic_stream(device_name, level_tx);
         if stream.is_none() {
-            log::warn!("🎙️ Não foi possível abrir o microfone.");
+            log::warn!("🎙️ Could not open microphone.");
         }
         // Blocks until the handle is dropped (the sender goes away), then closes the device.
         let _ = stop_rx.recv();
@@ -227,7 +227,7 @@ fn open_mic_stream(
     let channels = config.channels() as usize;
     let pcm_queue = gateway::get_mic_pcm_queue();
 
-    info!("Capturando microfone: {}Hz, {} canal(is), formato={:?}", sample_rate, channels, config.sample_format());
+    info!("Capturing microphone: {}Hz, {} channel(s), format={:?}", sample_rate, channels, config.sample_format());
 
     #[cfg(not(target_os = "linux"))]
     let stream_config: cpal::StreamConfig = config.clone().into();
@@ -270,7 +270,7 @@ fn open_mic_stream(
                     }
                 },
                 move |err| {
-                    log::error!("Erro no Stream de Microfone: {:?}", err);
+                    log::error!("Microphone stream error: {:?}", err);
                 },
                 None,
             ).ok()?
@@ -310,7 +310,7 @@ fn open_mic_stream(
                     }
                 },
                 move |err| {
-                    log::error!("Erro no Stream de Microfone I16: {:?}", err);
+                    log::error!("Microphone stream I16 error: {:?}", err);
                 },
                 None,
             ).ok()?
@@ -350,7 +350,7 @@ fn open_mic_stream(
                     }
                 },
                 move |err| {
-                    log::error!("Erro no Stream de Microfone I32: {:?}", err);
+                    log::error!("Microphone stream I32 error: {:?}", err);
                 },
                 None,
             ).ok()?
@@ -359,7 +359,7 @@ fn open_mic_stream(
     };
 
     if stream.play().is_ok() {
-        info!("🎙️ Stream de Microfone INICIADO COM SUCESSO! Rate: {}Hz -> 48000Hz", sample_rate);
+        info!("🎙️ Microphone stream STARTED SUCCESSFULLY! Rate: {}Hz -> 48000Hz", sample_rate);
         Some(stream)
     } else {
         log::error!("Failed to execute stream.play() on microphone!");
@@ -436,7 +436,7 @@ pub fn start_mic_loopback_stream(device_name: String) -> Option<cpal::Stream> {
                         for s in output.iter_mut() { *s = 0.0; }
                     }
                 },
-                move |err| { log::error!("Erro no Stream Loopback F32: {:?}", err); },
+                move |err| { log::error!("Loopback stream F32 error: {:?}", err); },
                 None,
             ).ok()?
         }
@@ -482,7 +482,7 @@ pub fn start_mic_loopback_stream(device_name: String) -> Option<cpal::Stream> {
                         for s in output.iter_mut() { *s = 0; }
                     }
                 },
-                move |err| { log::error!("Erro no Stream Loopback I16: {:?}", err); },
+                move |err| { log::error!("Loopback stream I16 error: {:?}", err); },
                 None,
             ).ok()?
         }
@@ -528,7 +528,7 @@ pub fn start_mic_loopback_stream(device_name: String) -> Option<cpal::Stream> {
                         for s in output.iter_mut() { *s = 0; }
                     }
                 },
-                move |err| { log::error!("Erro no Stream Loopback I32: {:?}", err); },
+                move |err| { log::error!("Loopback stream I32 error: {:?}", err); },
                 None,
             ).ok()?
         }
@@ -574,7 +574,7 @@ pub fn start_mic_loopback_stream(device_name: String) -> Option<cpal::Stream> {
                         for s in output.iter_mut() { *s = 32768; }
                     }
                 },
-                move |err| { log::error!("Erro no Stream Loopback U16: {:?}", err); },
+                move |err| { log::error!("Loopback stream U16 error: {:?}", err); },
                 None,
             ).ok()?
         }
@@ -582,7 +582,7 @@ pub fn start_mic_loopback_stream(device_name: String) -> Option<cpal::Stream> {
     };
 
     if stream.play().is_ok() {
-        info!("🎧 Stream Loopback ('Se Ouvir') iniciado com sucesso!");
+        info!("🎧 Mic test loopback stream started successfully!");
         Some(stream)
     } else {
         None

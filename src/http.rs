@@ -1,4 +1,4 @@
-﻿use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::json;
 use log::{info, warn, error};
 
@@ -62,7 +62,7 @@ impl DiscordHttpClient {
             match result {
                 Ok(guilds) => return Ok(guilds),
                 Err(e) if transient && attempt < RETRY_DELAYS_MS.len() => {
-                    warn!("Lista de servidores falhou ({}), tentando de novo em {} ms", e, RETRY_DELAYS_MS[attempt]);
+                    warn!("Server list fetch failed ({}), retrying in {} ms", e, RETRY_DELAYS_MS[attempt]);
                     tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAYS_MS[attempt])).await;
                     attempt += 1;
                 }
@@ -84,7 +84,7 @@ impl DiscordHttpClient {
                 let transient = status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
                 (Err(format!("Status HTTP {}", status)), transient)
             }
-            Err(e) => (Err(format!("Erro HTTP: {:?}", e)), true),
+            Err(e) => (Err(format!("HTTP Error: {:?}", e)), true),
         }
     }
 
@@ -100,7 +100,7 @@ impl DiscordHttpClient {
                 }
                 Err(format!("Status HTTP {}", status))
             }
-            Err(e) => Err(format!("Erro HTTP: {:?}", e)),
+            Err(e) => Err(format!("HTTP Error: {:?}", e)),
         }
     }
 
@@ -116,7 +116,7 @@ impl DiscordHttpClient {
                 }
                 Err(format!("Status HTTP {}", status))
             }
-            Err(e) => Err(format!("Erro HTTP: {:?}", e)),
+            Err(e) => Err(format!("HTTP Error: {:?}", e)),
         }
     }
 
@@ -132,7 +132,7 @@ impl DiscordHttpClient {
                 }
                 Err(format!("Status HTTP {}", status))
             }
-            Err(e) => Err(format!("Erro HTTP: {:?}", e)),
+            Err(e) => Err(format!("HTTP Error: {:?}", e)),
         }
     }
 
@@ -178,7 +178,7 @@ impl DiscordHttpClient {
                 }
                 Err(format!("Status HTTP {}", status))
             }
-            Err(e) => Err(format!("Erro HTTP: {:?}", e)),
+            Err(e) => Err(format!("HTTP Error: {:?}", e)),
         }
     }
 
@@ -194,7 +194,7 @@ impl DiscordHttpClient {
                 }
                 Err(format!("Status HTTP {}", status))
             }
-            Err(e) => Err(format!("Erro HTTP: {:?}", e)),
+            Err(e) => Err(format!("HTTP Error: {:?}", e)),
         }
     }
 
@@ -209,7 +209,7 @@ impl DiscordHttpClient {
                 }
                 Err(format!("Status HTTP {}", status))
             }
-            Err(e) => Err(format!("Erro HTTP: {:?}", e)),
+            Err(e) => Err(format!("HTTP Error: {:?}", e)),
         }
     }
 
@@ -220,10 +220,10 @@ impl DiscordHttpClient {
         match self.client.post(&url).json(&payload).send().await {
             Ok(resp) => {
                 if resp.status().is_success() {
-                    info!("Mensagem enviada com sucesso para o canal {}", channel_id);
+                    info!("Message sent successfully to channel {}", channel_id);
                     Ok(())
                 } else {
-                    let err = format!("Status de erro HTTP: {}", resp.status());
+                    let err = format!("HTTP error status: {}", resp.status());
                     error!("{}", err);
                     Err(err)
                 }
@@ -247,10 +247,10 @@ impl DiscordHttpClient {
         match self.client.patch(&url).json(&payload).send().await {
             Ok(resp) => {
                 if resp.status().is_success() {
-                    info!("Voice State REST @me atualizado com SUCESSO no servidor {}!", guild_id);
+                    info!("Voice State REST @me successfully updated on guild {}!", guild_id);
                     Ok(())
                 } else {
-                    let err = format!("Status de erro HTTP Voice State: {}", resp.status());
+                    let err = format!("HTTP Voice State error status: {}", resp.status());
                     error!("{}", err);
                     Err(err)
                 }
@@ -286,7 +286,7 @@ impl DiscordHttpClient {
                 }
                 Err(format!("Status HTTP {}", status))
             }
-            Err(e) => Err(format!("Erro HTTP ao buscar usuário: {:?}", e)),
+            Err(e) => Err(format!("HTTP error fetching user: {:?}", e)),
         }
     }
 
@@ -302,7 +302,7 @@ impl DiscordHttpClient {
                 }
                 Err(format!("Status HTTP {}", status))
             }
-            Err(e) => Err(format!("Erro HTTP ao buscar membro do servidor: {:?}", e)),
+            Err(e) => Err(format!("HTTP error fetching guild member: {:?}", e)),
         }
     }
 
@@ -318,7 +318,7 @@ impl DiscordHttpClient {
                 }
                 Err(format!("Status HTTP {}", status))
             }
-            Err(e) => Err(format!("Erro HTTP ao buscar membros do servidor: {:?}", e)),
+            Err(e) => Err(format!("HTTP error fetching guild members: {:?}", e)),
         }
     }
 
@@ -334,7 +334,7 @@ impl DiscordHttpClient {
                 }
                 Err(format!("Status HTTP {}", status))
             }
-            Err(e) => Err(format!("Erro HTTP ao buscar índice de comandos do servidor: {:?}", e)),
+            Err(e) => Err(format!("HTTP error fetching guild command index: {:?}", e)),
         }
     }
 
@@ -371,16 +371,16 @@ impl DiscordHttpClient {
         match self.client.post(url).json(&payload).send().await {
             Ok(resp) => {
                 if resp.status().is_success() || resp.status().as_u16() == 204 {
-                    info!("Slash command interaction '/{}' enviada com sucesso!", cmd_name);
+                    info!("Slash command interaction '/{}' sent successfully!", cmd_name);
                     Ok(())
                 } else {
-                    let err = format!("Status de erro HTTP na interação: {}", resp.status());
+                    let err = format!("HTTP error status in interaction: {}", resp.status());
                     error!("{}", err);
                     Err(err)
                 }
             }
             Err(e) => {
-                let err = format!("Falha de rede ao enviar slash command interaction: {:?}", e);
+                let err = format!("Network failure sending slash command interaction: {:?}", e);
                 error!("{}", err);
                 Err(err)
             }
@@ -394,16 +394,16 @@ impl DiscordHttpClient {
         match self.client.post(&url).json(&payload).send().await {
             Ok(resp) => {
                 if resp.status().is_success() || resp.status().as_u16() == 204 {
-                    info!("🔔 Chamada de DM tocando no canal {}...", channel_id);
+                    info!("🔔 DM call ringing in channel {}...", channel_id);
                     Ok(())
                 } else {
-                    let err = format!("Status de erro HTTP ao iniciar toque da DM: {}", resp.status());
+                    let err = format!("HTTP error status ringing DM: {}", resp.status());
                     warn!("{}", err);
                     Err(err)
                 }
             }
             Err(e) => {
-                let err = format!("Falha de rede ao iniciar toque da DM: {:?}", e);
+                let err = format!("Network failure ringing DM: {:?}", e);
                 warn!("{}", err);
                 Err(err)
             }
@@ -417,16 +417,16 @@ impl DiscordHttpClient {
         match self.client.post(&url).json(&payload).send().await {
             Ok(resp) => {
                 if resp.status().is_success() || resp.status().as_u16() == 204 {
-                    info!("🔕 Toque da chamada de DM interrompido no canal {}.", channel_id);
+                    info!("🔕 DM call ringing stopped in channel {}.", channel_id);
                     Ok(())
                 } else {
-                    let err = format!("Status de erro HTTP ao parar toque da DM: {}", resp.status());
+                    let err = format!("HTTP error status stopping DM ring: {}", resp.status());
                     warn!("{}", err);
                     Err(err)
                 }
             }
             Err(e) => {
-                let err = format!("Falha de rede ao parar toque da DM: {:?}", e);
+                let err = format!("Network failure stopping DM ring: {:?}", e);
                 warn!("{}", err);
                 Err(err)
             }

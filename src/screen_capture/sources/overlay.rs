@@ -211,7 +211,7 @@ pub fn start_window_border_overlay(target_hwnd: isize) {
                 }
             }
         })
-        .expect("Falha ao criar thread de overlay da borda de janela");
+        .expect("Failed to create window border overlay thread");
 }
 
 #[cfg(not(windows))]

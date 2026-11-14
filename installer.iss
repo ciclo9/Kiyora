@@ -1,7 +1,7 @@
-﻿; Inno Setup Script for kiyora Windows Installer
+; Inno Setup Script for kiyora Windows Installer
 #define MyAppName "kiyora"
-#define MyAppVersion "1.3.1-beta"
-#define MyAppPublisher "kiyora Project"
+#define MyAppVersion "1.0.0"
+#define MyAppPublisher "ciclo9"
 #define MyAppURL "https://github.com/ciclo9/kiyora"
 #define MyAppExeName "kiyora.exe"
 

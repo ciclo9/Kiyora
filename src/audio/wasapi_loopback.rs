@@ -281,11 +281,11 @@ pub fn start_wasapi_isolated_loopback(
         );
         let activate_fn: FnActivateAudioInterfaceAsync = match activate_fn_ptr {
             Some(f) => std::mem::transmute(f),
-            None => return Err("ActivateAudioInterfaceAsync não encontrada no mmdevapi.dll".to_string()),
+            None => return Err("ActivateAudioInterfaceAsync not found in mmdevapi.dll".to_string()),
         };
 
         let my_pid = windows_sys::Win32::System::Threading::GetCurrentProcessId();
-        info!("🛡️ [WASAPI LOOPBACK] Configurando captura de áudio excluindo PID do kiyora ({}) da gravação...", my_pid);
+        info!("🛡️ [WASAPI LOOPBACK] Configuring audio capture excluding Kiyora PID ({}) da gravação...", my_pid);
 
         let mut act_params = AUDIOCLIENT_ACTIVATION_PARAMS {
             ActivationType: 1, // AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK
@@ -349,12 +349,12 @@ pub fn start_wasapi_isolated_loopback(
         }
 
         if wait_res != 0 {
-            return Err(format!("Timeout aguardando ativação assíncrona do WASAPI (wait=0x{:08x})", wait_res));
+            return Err(format!("Timeout waiting for async WASAPI activation (wait=0x{:08x})", wait_res));
         }
 
         let client_ptr = match client_slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
             Some(p) => p as *mut IAudioClient,
-            None => return Err("Ponteiro IAudioClient não foi recebido no callback de ativação".to_string()),
+            None => return Err("IAudioClient pointer not received in callback de ativação".to_string()),
         };
 
         let client_vtbl = (*client_ptr).vtbl;
@@ -421,7 +421,7 @@ pub fn start_wasapi_isolated_loopback(
         }
 
         info!(
-            "🔊 [WASAPI LOOPBACK] Captura iniciada com sucesso (48000Hz, 2 canais PCM 16-bit) com EXCLUSÃO do processo kiyora!"
+            "🔊 [WASAPI LOOPBACK] Capture started successfully (48000Hz, 2 canais PCM 16-bit) com EXCLUSÃO do processo kiyora!"
         );
 
         let client_addr = client_ptr as usize;
@@ -495,7 +495,7 @@ pub fn start_wasapi_isolated_loopback(
                 let _ = ((*capture_vtbl).Release)(capture as *mut c_void);
                 let _ = ((*client_vtbl).Release)(client as *mut c_void);
                 windows_sys::Win32::Foundation::CloseHandle(event_handle);
-                info!("🔇 [WASAPI LOOPBACK] Stream isolado finalizado com sucesso.");
+                info!("🔇 [WASAPI LOOPBACK] Isolated stream finished successfully.");
             })
             .ok();
 

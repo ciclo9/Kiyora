@@ -1,4 +1,4 @@
-﻿use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU8, Ordering}};
 use std::time::{Duration, Instant};
 use log::info;
@@ -413,7 +413,7 @@ impl KeybindManager {
 
                                     let key_name = vkey_to_name(vk);
                                     let combo_str = format_combo_display(ctrl, shift, alt, key_name);
-                                    info!("⌨️ [KEYBINDS] Gravado com sucesso para target {}: {}", rec_target, combo_str);
+                                    info!("⌨️ [KEYBINDS] Successfully recorded for target {}: {}", rec_target, combo_str);
 
                                     // Save new combo
                                     {
@@ -604,7 +604,7 @@ impl KeybindManager {
                                     if let Some(vk) = evdev_code_to_vk(evdev_code) {
                                         let key_name = vkey_to_name(vk);
                                         let combo_str = format_combo_display(ctrl_down, shift_down, alt_down, key_name);
-                                        info!("⌨️ [KEYBINDS] Gravado com sucesso para target {}: {}", rec_target, combo_str);
+                                        info!("⌨️ [KEYBINDS] Successfully recorded for target {}: {}", rec_target, combo_str);
 
                                         {
                                             let mut cfg = config_arc.lock().unwrap_or_else(|e| e.into_inner());
@@ -714,7 +714,7 @@ impl KeybindManager {
             let _ = on_mute_trigger;
             let _ = on_deafen_trigger;
             let _ = on_recorded;
-            info!("⌨️ [KEYBINDS] Atalhos globais não suportados nativamente nesta plataforma.");
+            info!("⌨️ [KEYBINDS] Global shortcuts not supported natively nesta plataforma.");
         }
     }
 }

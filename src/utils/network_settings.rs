@@ -1,4 +1,4 @@
-﻿use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 use log::{info, error};
 
@@ -74,10 +74,10 @@ pub fn update_network_settings(
         route_media,
     };
     save_network_settings(&settings);
-    info!("🌐 Configurações de Proxy salvas: modo={}, host={}:{}", settings.proxy_mode, settings.proxy_host, settings.proxy_port);
+    info!("🌐 Proxy settings saved: mode={}, host={}:{}", settings.proxy_mode, settings.proxy_host, settings.proxy_port);
 }
 
-/// Aplica a configuração de proxy ativa a qualquer `reqwest::ClientBuilder`
+/// Applies active proxy settings to any `reqwest::ClientBuilder`
 pub fn apply_proxy_to_builder(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     let settings = get_network_settings();
     match settings.proxy_mode.as_str() {
@@ -88,7 +88,7 @@ pub fn apply_proxy_to_builder(mut builder: reqwest::ClientBuilder) -> reqwest::C
                     if !settings.proxy_username.is_empty() {
                         p = p.basic_auth(&settings.proxy_username, &settings.proxy_password);
                     }
-                    info!("🌐 Aplicando Proxy HTTP/HTTPS: {}", url);
+                    info!("🌐 Applying HTTP/HTTPS Proxy: {}", url);
                     builder = builder.proxy(p);
                 }
                 Err(e) => {
@@ -103,7 +103,7 @@ pub fn apply_proxy_to_builder(mut builder: reqwest::ClientBuilder) -> reqwest::C
                     if !settings.proxy_username.is_empty() {
                         p = p.basic_auth(&settings.proxy_username, &settings.proxy_password);
                     }
-                    info!("🌐 Aplicando Proxy SOCKS5: {}", url);
+                    info!("🌐 Applying SOCKS5 Proxy: {}", url);
                     builder = builder.proxy(p);
                 }
                 Err(e) => {
@@ -112,11 +112,11 @@ pub fn apply_proxy_to_builder(mut builder: reqwest::ClientBuilder) -> reqwest::C
             }
         }
         "system" => {
-            info!("🌐 Utilizando Proxy do Sistema Operacional.");
-            // reqwest consulta variáveis de ambiente do sistema (HTTP_PROXY / HTTPS_PROXY / ALL_PROXY)
+            info!("🌐 Using Operating System Proxy.");
+            // reqwest queries system environment variables (HTTP_PROXY / HTTPS_PROXY / ALL_PROXY)
         }
         _ => {
-            // "off" (Direct) -> Desativa qualquer proxy de ambiente
+            // "off" (Direct) -> Disable any environment proxy
             builder = builder.no_proxy();
         }
     }
@@ -139,9 +139,9 @@ pub async fn test_proxy_connection() -> Result<String, String> {
         Ok(resp) => {
             let latency_ms = start.elapsed().as_millis();
             if resp.status().is_success() {
-                Ok(format!("Conexão bem-sucedida! Latência: {}ms (Status: {})", latency_ms, resp.status()))
+                Ok(format!("Connection successful! Latency: {}ms (Status: {})", latency_ms, resp.status()))
             } else {
-                Ok(format!("Proxy respondeu em {}ms, mas com status HTTP {}", latency_ms, resp.status()))
+                Ok(format!("Proxy responded in {}ms, but with HTTP status {}", latency_ms, resp.status()))
             }
         }
         Err(e) => {
@@ -150,14 +150,14 @@ pub async fn test_proxy_connection() -> Result<String, String> {
     }
 }
 
-/// Verifica se o erro ocorrido tem indícios de ser causado por proxy inacessível ou falha de conexão com o proxy
+/// Checks whether error suggests unreachable proxy or proxy connection failure
 pub fn is_proxy_error(err_str: &str) -> bool {
     let settings = get_network_settings();
     if settings.proxy_mode == "off" {
         return false;
     }
     let lower = err_str.to_lowercase();
-    // Se for 401 Unauthorized e NÃO contiver indicação de falha de conexão TCP/HTTP, o Discord respondeu diretamente rejeitando o token
+    // If 401 Unauthorized and does NOT contain connection failure indicators, Discord responded directly rejecting token
     if lower.contains("401") && !lower.contains("connect") && !lower.contains("10061") && !lower.contains("refused") {
         return false;
     }
@@ -168,7 +168,7 @@ pub fn is_proxy_error(err_str: &str) -> bool {
         || lower.contains("timeout")
         || lower.contains("proxy")
         || lower.contains("socks")
-        || lower.contains("erro de rede")
+        || lower.contains("network error")
         || lower.contains("reset by peer")
         || lower.contains("failed to lookup")
         || lower.contains("websocket")
@@ -177,15 +177,15 @@ pub fn is_proxy_error(err_str: &str) -> bool {
         || !lower.contains("401")
 }
 
-/// Formata a mensagem de alerta amigável e instrutiva para a tela de login
+/// Formats friendly instructional alert message for login screen
 pub fn format_proxy_alert_message() -> String {
     let settings = get_network_settings();
     let mode = settings.proxy_mode.to_uppercase();
     if settings.proxy_mode == "system" {
-        "Falha de conexão via Proxy do Sistema! Clique aqui ou na engrenagem no topo para abrir as Configurações e desativá-lo.".to_string()
+        "Connection failed via System Proxy! Click here or the gear icon at the top to open Settings and disable it.".to_string()
     } else {
         format!(
-            "O Proxy ({}: {}:{}) está inacessível ou recusando conexão! Clique aqui ou na engrenagem no topo para abrir as Configurações e desativá-lo.",
+            "Proxy ({}: {}:{}) is unreachable or refusing connection! Click here or the gear icon at the top to open Settings and disable it.",
             mode, settings.proxy_host, settings.proxy_port
         )
     }
