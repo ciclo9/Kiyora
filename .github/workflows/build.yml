@@ -1,4 +1,4 @@
-﻿name: Build & Release kiyora
+name: Build & Release kiyora
 
 on:
   push:
@@ -63,13 +63,13 @@ jobs:
           iscc installer.iss
 
       - name: Upload Windows Portable Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: kiyora-windows-x64-portable
           path: kiyora-windows-x64-portable.zip
 
       - name: Upload Windows Setup Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: kiyora-Setup-x64
           path: target/installer/kiyora-Setup-x64.exe
@@ -125,7 +125,7 @@ jobs:
           tar -czvf kiyora-linux-x64.tar.gz -C release-pkg .
 
       - name: Upload Linux tar.gz Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: kiyora-linux-x64
           path: kiyora-linux-x64.tar.gz
@@ -193,7 +193,7 @@ jobs:
           test -f dist/kiyora-x86_64.AppImage
 
       - name: Upload Linux AppImage Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: kiyora-x86_64.AppImage
           path: dist/kiyora-x86_64.AppImage
