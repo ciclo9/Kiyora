@@ -4219,7 +4219,7 @@ dependencies = [
  "winit",
  "winres",
  "x25519-dalek 3.0.0",
- "zune-jpeg 0.4.21",
+ "zune-jpeg 0.5.15",
 ]
 
 [[package]]
