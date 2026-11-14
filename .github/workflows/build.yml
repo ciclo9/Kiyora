@@ -1,4 +1,4 @@
-﻿name: Build & Release kiyora
+name: Build & Release kiyora
 
 on:
   push:
@@ -215,7 +215,7 @@ jobs:
           echo "Versão detectada: $VERSION"
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release-artifacts
           merge-multiple: true
